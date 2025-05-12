@@ -72,7 +72,11 @@ let gameUnits = []; // Holds all placed units { type, owner, lon, lat, id, ammo?
 let selectedUnitForFiring = null; // ID of the silo selected for firing
 let gameCities = []; // Simplified list for quick lookup: { name, lon, lat, population, initialPopulation, ownerTerritory, destroyed: false, id, state? }
 let selectedCityForTargeting = null; // ID of city selected for targeting
-let selectedNavalUnitId = null; // ID of the selected naval unit for movement/actions
+let selectedSingleUnitId = null; // ID of a single selected unit (naval or land)
+let isBoxSelecting = false;
+let boxSelectStartX = 0;
+let boxSelectStartY = 0;
+let selectedUnitGroup = []; // Array to hold IDs of units in the current selection group
 
 
 // Missile & Effects Data
@@ -372,7 +376,7 @@ function drawGameScreen() {
     drawBackgroundMapAndCities();
     gameUnits.forEach(unit => { drawUnit(unit); });
     drawNeutralPlanes(); // <<< DRAW PLANES
-    drawNavalUnits(gameUnits, selectedNavalUnitId); // <<< DRAW NAVAL UNITS (pass selection)
+    drawNavalUnits(gameUnits, selectedSingleUnitId); // <<< DRAW NAVAL UNITS (pass selection)
     drawMissiles();
     drawABMs(); // <<< DRAW ABMS (Need to create this function)
     drawExplosions(); // Includes ICBM impacts
@@ -418,6 +422,17 @@ function drawGameUIOverlay() {
         textAlign(CENTER, BOTTOM); fill(MENU_HIGHLIGHT_COLOR[0], MENU_HIGHLIGHT_COLOR[1], MENU_HIGHLIGHT_COLOR[2], 220); textSize(18);
         let city = gameCities.find(c => c.id === selectedCityForTargeting);
         if (city) text(`Target: ${city.name}. CLICK AGAIN TO LAUNCH.`, width / 2, height - 55);
+    }
+
+    // Draw Box Selection Rectangle
+    if (isBoxSelecting) {
+        push();
+        noFill();
+        stroke(0, 255, 0, 150); // Green, semi-transparent
+        strokeWeight(1);
+        rectMode(CORNERS); // Draw from start to current mouse
+        rect(boxSelectStartX, boxSelectStartY, mouseX, mouseY);
+        pop();
     }
     pop();
 }
@@ -1358,15 +1373,38 @@ function mousePressed() {
     prevMouseX = mouseX; // Initialize prevMouse for drag calculation
     prevMouseY = mouseY; // Initialize prevMouse for drag calculation
     isDragging = false; // Reset drag flag on new press
+    isBoxSelecting = false; // Reset box select flag
 
-    if (gameState === 'MainMenu') {
+    if (gameState === 'Playing') {
+        // Store potential start of box select
+        boxSelectStartX = mouseX;
+        boxSelectStartY = mouseY;
+
+        // Clear previous selections
+        if (selectedSingleUnitId) {
+            let prevSelected = gameUnits.find(u => u.id === selectedSingleUnitId);
+            if (prevSelected) prevSelected.state = 'idle';
+        }
+        selectedSingleUnitId = null;
+        selectedUnitGroup.forEach(id => { // Reset state of units in previous group
+            let unit = gameUnits.find(u => u.id === id);
+            if (unit) unit.state = 'idle';
+        });
+        selectedUnitGroup = [];
+        if (selectedUnitForFiring) {
+            let prevSilo = gameUnits.find(u => u.id === selectedUnitForFiring);
+            if (prevSilo) prevSilo.state = 'idle';
+        }
+        selectedUnitForFiring = null;
+        selectedCityForTargeting = null;
+
+        // Note: handleGameClick is now called from mouseReleased for 'Playing' state if not dragging/boxSelecting
+    } else if (gameState === 'MainMenu') {
         handleMainMenuClick();
     } else if (gameState === 'Options') {
         handleOptionsClick();
     } else if (gameState === 'Setup') {
         handleSetupClick();
-    } else if (gameState === 'Playing') {
-        handleGameClick();
     }
 }
 
@@ -1445,62 +1483,104 @@ function handleSetupClick() {
 function handleGameClick() {
     let clickWorldPos = screenToWorld(mouseX, mouseY);
 
-    // --- Priority 1: Issue Command to Selected Naval Unit ---
-    if (selectedNavalUnitId) {
-        let selectedUnit = gameUnits.find(u => u.id === selectedNavalUnitId);
+    // --- Priority 1: Issue Command to Selected Unit(s) ---
+    if (selectedSingleUnitId) { // A single unit is selected
+        let selectedUnit = gameUnits.find(u => u.id === selectedSingleUnitId);
         if (selectedUnit) {
-            // Check if clicking on an enemy target for attack (TODO)
-            // For now, assume click is a move order
-            let targetCity = findClickedCity(clickWorldPos.lon, clickWorldPos.lat);
-            if (targetCity && targetCity.ownerTerritory !== playerTerritory && selectedUnit.type === 'Submarine') {
-                 // If a Submarine is selected and clicks an enemy city, try to launch SLBM
-                 if (launchSLBM(selectedUnit, targetCity.lon, targetCity.lat, activeMissiles)) {
-                     console.log(`Player ordered SLBM launch from ${selectedUnit.id} at ${targetCity.name}`);
-                     selectedNavalUnitId = null; // Deselect after firing
-                     selectedUnit.state = 'idle'; // Reset state? Or firing state?
-                 } else {
-                     // Launch failed (no ammo, DEFCON too high, etc.) - keep selected
-                     console.log(`SLBM launch failed for ${selectedUnit.id}.`);
-                 }
-            } else {
-                 // Issue move order
-                 if (setNavalUnitDestination(selectedNavalUnitId, clickWorldPos.lon, clickWorldPos.lat, gameUnits)) {
-                     console.log(`Player ordered ${selectedUnit.type} ${selectedNavalUnitId} to move.`);
-                     selectedNavalUnitId = null; // Deselect after issuing move order
-                     selectedUnit.state = 'moving'; // Ensure state is set
-                 } else {
-                     console.warn("Failed to set naval destination."); // Should not happen if unit exists
-                     selectedNavalUnitId = null; // Deselect if something went wrong
-                 }
+            // Handle actions for selected NAVAL units first
+            if (selectedUnit.type === 'Carrier' || selectedUnit.type === 'Submarine' || selectedUnit.type === 'Battleship') {
+                let targetCity = findClickedCity(clickWorldPos.lon, clickWorldPos.lat);
+                // SLBM launch for selected Submarine targeting an enemy city
+                if (targetCity && targetCity.ownerTerritory !== playerTerritory && selectedUnit.type === 'Submarine') {
+                    if (launchSLBM(selectedUnit, targetCity.lon, targetCity.lat, activeMissiles)) {
+                        console.log(`Player ordered SLBM launch from ${selectedUnit.id} at ${targetCity.name}`);
+                        selectedUnit.state = 'idle'; // Reset state after firing
+                    } else {
+                        console.log(`SLBM launch failed for ${selectedUnit.id}.`);
+                        // Keep unit selected if launch fails, so don't nullify selectedSingleUnitId yet
+                    }
+                    selectedSingleUnitId = null; // Deselect after action attempt (success or fail)
+                } else { // Move order for other naval units or sub not targeting city for SLBM
+                    if (setNavalUnitDestination(selectedSingleUnitId, clickWorldPos.lon, clickWorldPos.lat, gameUnits)) {
+                        console.log(`Player ordered ${selectedUnit.type} ${selectedSingleUnitId} to move.`);
+                        // setNavalUnitDestination sets state to 'moving'
+                    } else {
+                        console.warn("Failed to set naval destination for single unit.");
+                    }
+                    selectedSingleUnitId = null; // Deselect after issuing move order
+                }
+                return; // Action for naval unit taken, exit.
             }
+            // If the selectedSingleUnitId is a Silo, this block is skipped, and logic proceeds to Priority 3 for firing.
         } else {
-            selectedNavalUnitId = null; // Selected unit somehow disappeared, deselect
+            selectedSingleUnitId = null; // Unit disappeared
+            return; // Exit if selected unit not found
         }
-        return; // Action taken, exit handler
+    } else if (selectedUnitGroup.length > 0) { // A group of units is selected
+        let allNavalInGroup = selectedUnitGroup.every(id => {
+            let unit = gameUnits.find(u => u.id === id);
+            return unit && (unit.type === 'Carrier' || unit.type === 'Submarine' || unit.type === 'Battleship');
+        });
+
+        if (allNavalInGroup) {
+            console.log(`Issuing move order to naval group of ${selectedUnitGroup.length} units.`);
+            let successCount = 0;
+            selectedUnitGroup.forEach(id => {
+                if (setNavalUnitDestination(id, clickWorldPos.lon, clickWorldPos.lat, gameUnits)) {
+                    successCount++;
+                }
+            });
+            if (successCount > 0) {
+                 selectedUnitGroup.forEach(id => { // Reset state for units that got the command
+                    let unit = gameUnits.find(u => u.id === id);
+                    if(unit) unit.state = 'moving'; // Should be set by setNavalUnitDestination, but ensure
+                 });
+            }
+            selectedUnitGroup = []; // Deselect group after issuing command
+            // Reset individual states from 'selected_in_group' to 'moving' or 'idle' is handled by setNavalUnitDestination or if it fails
+        } else {
+            // Group contains non-naval units or mixed, currently no group move for them.
+            console.log("Selected group contains non-naval units or is mixed. No group move action defined for this combination yet.");
+            // Deselect group if no action taken
+            selectedUnitGroup.forEach(id => {
+                let unit = gameUnits.find(u => u.id === id);
+                if (unit) unit.state = 'idle';
+            });
+            selectedUnitGroup = [];
+
+        }
+        return; // Action taken or attempted
     }
 
-    // --- Priority 2: Select a Player Naval Unit ---
-    // Use findClickedUnit without type filter first
+    // --- Priority 2: Select a Single Player Unit (Naval or Silo) ---
     let clickedUnit = findClickedUnit(clickWorldPos.lon, clickWorldPos.lat, null, playerTerritory);
-    if (clickedUnit && (clickedUnit.type === 'Carrier' || clickedUnit.type === 'Submarine' || clickedUnit.type === 'Battleship')) {
-        selectedNavalUnitId = clickedUnit.id;
-        selectedUnitForFiring = null; // Deselect any silo
-        selectedCityForTargeting = null; // Deselect any city target
-        // Update unit state visually? (e.g., add highlight in drawNavalUnits)
-        clickedUnit.state = 'selected'; // Use state for highlighting
-        console.log(`Selected Naval Unit: ${clickedUnit.type} ${clickedUnit.id}`);
-        // Deselect previously selected naval unit if different
-        gameUnits.forEach(u => {
-            if (u.id !== selectedNavalUnitId && (u.type === 'Carrier' || u.type === 'Submarine' || u.type === 'Battleship') && u.state === 'selected') {
-                u.state = 'idle';
-            }
-        });
+    if (clickedUnit && (clickedUnit.type === 'Carrier' || clickedUnit.type === 'Submarine' || clickedUnit.type === 'Battleship' || clickedUnit.type === 'Silo')) {
+        // Deselect any previously selected single unit or group
+        if(selectedSingleUnitId && selectedSingleUnitId !== clickedUnit.id) {
+            let prev = gameUnits.find(u => u.id === selectedSingleUnitId); if(prev) prev.state = 'idle';
+        }
+        selectedUnitGroup.forEach(id => { let u = gameUnits.find(uid => uid.id === id); if(u) u.state = 'idle'; });
+        selectedUnitGroup = [];
+
+        selectedSingleUnitId = clickedUnit.id;
+        clickedUnit.state = 'selected';
+        selectedUnitForFiring = null; // Deselect silo for firing if selecting another unit
+        selectedCityForTargeting = null;
+
+        if (clickedUnit.type === 'Silo') {
+            selectedUnitForFiring = clickedUnit.id; // If it's a silo, also set it for firing
+            console.log(`Selected Silo: ${clickedUnit.id} (Ammo: ${clickedUnit.ammo}) for potential firing.`);
+        } else {
+            console.log(`Selected Unit: ${clickedUnit.type} ${clickedUnit.id}`);
+        }
         return; // Action taken
     }
 
     // --- Priority 3: Handle Silo Firing (Existing Logic) ---
     if (true) { // Allow firing logic (Original condition: DEFCON level check)
-        if (selectedUnitForFiring) { // A silo is already selected, this click is for the target
+        // This block now primarily handles the case where a silo was *already* selected (selectedUnitForFiring is set)
+        // and this click is its target.
+        if (selectedUnitForFiring) {
             let silo = gameUnits.find(u => u.id === selectedUnitForFiring);
             let targetCity = findClickedCity(clickWorldPos.lon, clickWorldPos.lat);
 
@@ -1539,91 +1619,141 @@ function handleGameClick() {
             }
             return; // Action taken
 
-        } else { // No silo selected yet, this click is to select a silo
-            let clickedSilo = findClickedUnit(clickWorldPos.lon, clickWorldPos.lat, 'Silo', playerTerritory);
-            if (clickedSilo) {
-                if (clickedSilo.ammo > 0) {
-                    console.log(`Selected Silo ${clickedSilo.id} (Ammo: ${clickedSilo.ammo}). Click target city or location.`);
-                    // Deselect previously selected silo
-                    if(selectedUnitForFiring && selectedUnitForFiring !== clickedSilo.id) {
-                        let prevSilo = gameUnits.find(u => u.id === selectedUnitForFiring);
-                        if(prevSilo) prevSilo.state = 'idle';
-                    }
-                    selectedUnitForFiring = clickedSilo.id;
-                    clickedSilo.state = 'selected';
-                    selectedCityForTargeting = null; // Clear city target
-                    selectedNavalUnitId = null; // Deselect naval unit
-                    // Deselect previously selected naval unit state
-                    gameUnits.forEach(u => {
-                         if ((u.type === 'Carrier' || u.type === 'Submarine' || u.type === 'Battleship') && u.state === 'selected') {
-                             u.state = 'idle';
-                         }
-                     });
-                } else {
-                    console.log(`Selected Silo ${clickedSilo.id} - OUT OF AMMO.`);
-                     if(selectedUnitForFiring) { let prevSilo = gameUnits.find(u => u.id === selectedUnitForFiring); if(prevSilo) prevSilo.state = 'idle'; selectedUnitForFiring = null;}
-                     selectedCityForTargeting = null;
-                     selectedNavalUnitId = null; // Deselect naval unit
-                }
-                return; // Action taken
-            }
+        } else {
+             // No unit was previously selected for firing.
+             // Single unit selection (including silos for firing) is handled in Priority 2.
+             // This 'else' means the click was not on any unit and no unit was selected for firing.
         }
     }
 
     // --- Priority 4: Clicked on empty space (Deselect everything) ---
-    if (selectedUnitForFiring) {
+    // This runs if no other action was taken by the click.
+    if (selectedSingleUnitId) {
+        let unit = gameUnits.find(u => u.id === selectedSingleUnitId);
+        if (unit) unit.state = 'idle';
+        selectedSingleUnitId = null;
+        console.log("Single unit deselected.");
+    }
+    if (selectedUnitGroup.length > 0) {
+        selectedUnitGroup.forEach(id => {
+            let unit = gameUnits.find(u => u.id === id);
+            if (unit) unit.state = 'idle';
+        });
+        selectedUnitGroup = [];
+        console.log("Unit group deselected.");
+    }
+    if (selectedUnitForFiring) { // Also clear silo firing selection
         let silo = gameUnits.find(u => u.id === selectedUnitForFiring);
         if(silo) silo.state = 'idle';
         selectedUnitForFiring = null;
-        selectedCityForTargeting = null;
-        console.log("Firing cancelled / Silo deselected.");
-    }
-    if (selectedNavalUnitId) {
-         let navalUnit = gameUnits.find(u => u.id === selectedNavalUnitId);
-         if(navalUnit) navalUnit.state = 'idle'; // Reset state
-         selectedNavalUnitId = null;
-         console.log("Naval unit deselected.");
+        console.log("Silo firing selection cleared.");
     }
     selectedCityForTargeting = null; // Always clear city target if clicking empty space
-
 }
 
 
 function mouseDragged() {
-    if (mouseX === initialMouseX && mouseY === initialMouseY) {
-        // If the mouse hasn't moved significantly, don't start dragging yet
-        // This helps distinguish clicks from small drags
-        return; 
-    }
-    isDragging = true; // Set drag flag if mouse moved significantly
+    let distDragged = dist(initialMouseX, initialMouseY, mouseX, mouseY);
+    const dragThreshold = 5; // Pixels to move before it's considered a drag
 
-    if (gameState === 'Playing' || gameState === 'Setup' || gameState === 'MainMenu' || gameState === 'Options') {
+    if (gameState === 'Playing') {
+        if (distDragged > dragThreshold && !isDragging) { // Start of a drag
+            isBoxSelecting = true;
+            isDragging = true; // General drag flag
+        }
+    } else if (distDragged > dragThreshold) { // For other states, it's a map pan
+        isDragging = true;
+    }
+
+    if (isDragging && !isBoxSelecting && (gameState === 'Playing' || gameState === 'Setup' || gameState === 'MainMenu' || gameState === 'Options')) {
+        // Map Panning Logic (if not box selecting)
         let dx = mouseX - prevMouseX;
         let dy = mouseY - prevMouseY;
         let worldDx = dx / zoom;
         let worldDy = dy / zoom;
-        let lonPerPixel = 360 / (BASE_WORLD_WIDTH); // Approximate degrees per world pixel
-        let latPerPixel = 180 / (BASE_WORLD_HEIGHT); // Approximate degrees per world pixel
+        let lonPerPixel = 360 / (BASE_WORLD_WIDTH);
+        let latPerPixel = 180 / (BASE_WORLD_HEIGHT);
         centerLon -= worldDx * lonPerPixel;
-        centerLat += worldDy * latPerPixel; // Latitude increases upwards in screen coords, downwards in world coords
+        centerLat += worldDy * latPerPixel;
         centerLon = constrain(centerLon, -180, 180);
         centerLat = constrain(centerLat, -90, 90);
-    } else if (gameState === 'Options') {
-         handleVolumeClick(); // Allow dragging on volume sliders
+    } else if (gameState === 'Options' && isDragging) { // Dragging for volume sliders
+         handleVolumeClick();
     }
+
     prevMouseX = mouseX;
     prevMouseY = mouseY;
 }
 
 function mouseReleased() {
-    if (!isDragging) {
-        // This was a click, not a drag.
-        // The actual click logic is handled in mousePressed.
-        // We might add logic here if needed for actions *after* a click is confirmed.
+    if (isBoxSelecting) {
+        // Finalize box selection
+        selectedUnitGroup = []; // Clear previous group
+        let boxMinX = min(boxSelectStartX, mouseX);
+        let boxMaxX = max(boxSelectStartX, mouseX);
+        let boxMinY = min(boxSelectStartY, mouseY);
+        let boxMaxY = max(boxSelectStartY, mouseY);
+
+        // Deselect all units first to handle units no longer in the box
+        gameUnits.forEach(unit => {
+            if (unit.owner === playerTerritory && (unit.type === 'Carrier' || unit.type === 'Submarine' || unit.type === 'Battleship' || unit.type === 'Silo')) {
+                if (unit.state === 'selected' || unit.state === 'selected_in_group') {
+                    unit.state = 'idle';
+                }
+            }
+        });
+        selectedSingleUnitId = null; // Clear single selection when box selecting
+        selectedUnitForFiring = null; // Clear silo firing selection
+
+        for (let unit of gameUnits) {
+            if (unit.owner === playerTerritory &&
+                (unit.type === 'Carrier' || unit.type === 'Submarine' || unit.type === 'Battleship' || unit.type === 'Silo')) { // Include Silos
+                let screenPos = worldToScreen(unit.lon, unit.lat);
+                if (screenPos.x >= boxMinX && screenPos.x <= boxMaxX &&
+                    screenPos.y >= boxMinY && screenPos.y <= boxMaxY) {
+                    selectedUnitGroup.push(unit.id);
+                }
+            }
+        }
+
+        if (selectedUnitGroup.length === 1) {
+            selectedSingleUnitId = selectedUnitGroup[0];
+            let unit = gameUnits.find(u => u.id === selectedSingleUnitId);
+            if(unit) {
+                unit.state = 'selected';
+                if (unit.type === 'Silo') {
+                    selectedUnitForFiring = unit.id; // If the single selected is a silo, set for firing
+                     console.log(`Box selected single Silo: ${selectedSingleUnitId} for firing.`);
+                } else {
+                    console.log(`Box selected single Naval unit: ${selectedSingleUnitId}`);
+                }
+            }
+            selectedUnitGroup = []; // Clear group as it's a single selection
+        } else if (selectedUnitGroup.length > 0) {
+            selectedSingleUnitId = null; // Group selected
+            selectedUnitGroup.forEach(id => {
+                let unit = gameUnits.find(u => u.id === id);
+                if(unit) unit.state = 'selected_in_group';
+            });
+            console.log(`Box selected unit group: ${selectedUnitGroup.length} units.`);
+        } else {
+            // No units in box, ensure individual selection is also cleared
+            selectedSingleUnitId = null;
+        }
+        isBoxSelecting = false;
+
+    } else if (!isDragging && gameState === 'Playing') {
+        // This was a click (not a drag for panning or box selection)
+        // Call handleGameClick only if it wasn't a drag that started box selection but didn't select anything
+        if (dist(initialMouseX, initialMouseY, mouseX, mouseY) < 5) { // Check if it was a genuine click
+             handleGameClick();
+        }
     }
-    isDragging = false; // Reset drag flag
-    initialMouseX = -1; // Reset initial click position
+
+    isDragging = false;
+    initialMouseX = -1;
     initialMouseY = -1;
+    // boxSelectStartX = 0; boxSelectStartY = 0; // Not strictly needed to reset here
 }
 
 function mouseWheel(event) {

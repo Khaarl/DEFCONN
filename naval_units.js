@@ -22,7 +22,7 @@ const BATTLESHIP_SPEED_DPS = KNOTS_TO_DPS(BATTLESHIP_SPEED_KNOTS);
 const SUB_SLBM_AMMO = 4;
 const CARRIER_AIRCRAFT_CAPACITY = 20; // Fighters/Bombers mix?
 
-const NAVAL_UNIT_SIZE = 10; // Base size in pixels
+const NAVAL_UNIT_SIZE = 12; // Base size in pixels - Increased
 const CARRIER_COLOR = [180, 180, 100, 220]; // Khaki-ish
 const SUBMARINE_COLOR_SUBMERGED = [50, 80, 150, 150]; // Deep blue, semi-transparent
 const SUBMARINE_COLOR_SURFACED = [100, 120, 180, 200]; // Lighter blue
@@ -215,7 +215,7 @@ function drawNavalUnits(pGameUnits, pSelectedNavalUnitId) { // Add selected ID p
             continue;
         }
 
-        noStroke(); // Apply to all naval units for now
+        // noStroke(); // Apply to all naval units for now - will set per unit
 
         let unitBaseColor;
         if (unit.type === 'Carrier') unitBaseColor = CARRIER_COLOR;
@@ -236,14 +236,26 @@ function drawNavalUnits(pGameUnits, pSelectedNavalUnitId) { // Add selected ID p
 
 
         if (unit.type === 'Carrier') {
+            stroke(0, 0, 0, 100); // Thin black outline for carriers
+            strokeWeight(max(0.5, 1 / zoom));
             rect(screenPos.x, screenPos.y, size * 1.5, size * 0.6); // Longer, thinner rectangle
         } else if (unit.type === 'Submarine') {
+            if (unit.submerged) {
+                stroke(20, 30, 80, 150); // Darker outline for submerged
+            } else {
+                stroke(50, 60, 100, 180); // Lighter outline for surfaced
+            }
+            strokeWeight(max(0.5, 1 / zoom));
             ellipse(screenPos.x, screenPos.y, size * 1.2, size * 0.5); // Elliptical shape
+
+            // Re-apply fill for ammo indicator if stroke was applied
+            noStroke(); // Turn off stroke for the small ammo dot
             if (unit.ammo !== undefined && unit.ammo <= 1 && (isPlayer || unit.isPlayerDetected)) { // Show ammo if player's or detected
                  fill(255, 0, 0, 200); // Red indicator
                  ellipse(screenPos.x + size * 0.5, screenPos.y - size * 0.2, size * 0.2);
             }
         } else if (unit.type === 'Battleship') {
+            noStroke(); // Battleships might look better without a stroke or with a very subtle one
             rect(screenPos.x, screenPos.y, size, size * 0.7); // Stubbier rectangle
         }
 
