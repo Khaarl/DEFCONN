@@ -25,16 +25,24 @@ def run_server():
     for file in required_files:
         if not os.path.exists(file):
             print(f"Warning: {file} not found in project directory")
+    print("File check complete.") # Added log
 
     with socketserver.TCPServer(("", PORT), CORSRequestHandler) as httpd:
         print(f"\nServing at http://localhost:{PORT}")
         print("Press Ctrl+C to stop the server")
-        webbrowser.open_new_tab(f"http://localhost:{PORT}/index.html")
         
+        try:
+            webbrowser.open_new_tab(f"http://localhost:{PORT}/index.html")
+        except Exception as e:
+            print(f"Error opening browser: {e}")
+            print("Please manually open http://localhost:8000/index.html in your browser.")
+
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
             print("\nServer stopped")
+        except Exception as e:
+            print(f"An error occurred during server operation: {e}") # Catch other errors
 
 if __name__ == "__main__":
     run_server()
