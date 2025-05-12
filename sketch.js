@@ -72,6 +72,7 @@ let gameUnits = []; // Holds all placed units { type, owner, lon, lat, id, ammo?
 let selectedUnitForFiring = null; // ID of the silo selected for firing
 let gameCities = []; // Simplified list for quick lookup: { name, lon, lat, population, initialPopulation, ownerTerritory, destroyed: false, id, state? }
 let selectedCityForTargeting = null; // ID of city selected for targeting
+let selectedNavalUnitId = null; // ID of the selected naval unit for movement/actions
 
 
 // Missile & Effects Data
@@ -90,6 +91,14 @@ const ABM_LAUNCH_RANGE_DEG = 15; // How close an enemy missile needs to be to a 
 const ABM_SPEED_DEG_PER_SEC = 10.0; // ABMs should be faster than ICBMs
 const ABM_INTERCEPT_CHANCE = 0.75; // 75% chance to destroy target on hit
 const ABM_INTERCEPT_RADIUS_DEG = 0.3; // How close ABM needs to get to target missile
+
+// --- Naval Unit Constants (from naval_units.js, but needed for setup in sketch.js) ---
+// SUB_SLBM_AMMO is defined in naval_units.js and globally available.
+// --- Naval Detection Ranges (Degrees) ---
+const CARRIER_DETECTION_RANGE = 15;
+const SUBMARINE_DETECTION_RANGE = 10;
+const BATTLESHIP_DETECTION_RANGE = 12;
+
 
 // Game Progression Variables
 let currentDefconLevel = 5;
@@ -357,10 +366,13 @@ function drawGameScreen() {
     updateMissiles(); // Updates ICBMs
     updateABMs(); // <<< UPDATE ABM POSITIONS (Need to create this function)
     updateNeutralPlanes(gameCities, deltaTime); // <<< CALL PLANE UPDATE (pass cities and deltaTime)
+    updateNavalUnits(gameUnits, deltaTime); // <<< CALL NAVAL UPDATE
+    updateNavalDetection(gameUnits, playerTerritory); // <<< CALL NAVAL DETECTION
     // --- Drawing ---
     drawBackgroundMapAndCities();
     gameUnits.forEach(unit => { drawUnit(unit); });
     drawNeutralPlanes(); // <<< DRAW PLANES
+    drawNavalUnits(gameUnits, selectedNavalUnitId); // <<< DRAW NAVAL UNITS (pass selection)
     drawMissiles();
     drawABMs(); // <<< DRAW ABMS (Need to create this function)
     drawExplosions(); // Includes ICBM impacts
@@ -539,23 +551,40 @@ function initializeGameSetup(playerTerritoryKey) {
 
     // *** INITIALIZE PLANES AFTER CITIES ARE READY ***
     initializeNeutralPlanes(gameCities); // Pass the processed cities
+    initializeNavalLogic(); // Initialize naval module systems
 
     // --- Initialize Player Assets ---
     // (Only need to define assets for the human player to place)
     let playerAssetsConfig = [
-        { type: 'Silo', count: 3, ammo: 10, mode: 'OFFENSIVE', state: 'idle' }, // <<< Add default mode
-        { type: 'Radar', count: 2, range: 25, state: 'active' }
+        { type: 'Silo', count: 3, ammo: 10, mode: 'OFFENSIVE', state: 'idle' },
+        { type: 'Radar', count: 2, range: 25, state: 'active' },
+        { type: 'Carrier', count: 1, state: 'idle', detectionRange: CARRIER_DETECTION_RANGE },
+        { type: 'Submarine', count: 2, ammo: SUB_SLBM_AMMO, state: 'idle', submerged: true, detectionRange: SUBMARINE_DETECTION_RANGE },
+        { type: 'Battleship', count: 2, state: 'idle', detectionRange: BATTLESHIP_DETECTION_RANGE }
     ];
     assetsToPlace = []; // Reset player's placement list
     playerAssetsConfig.forEach(assetGroup => {
         for (let i = 0; i < assetGroup.count; i++) {
-            let unitData = { type: assetGroup.type };
+            let unitData = {
+                type: assetGroup.type,
+                state: assetGroup.state || 'idle',
+                detectionRange: assetGroup.detectionRange // Add detection range
+                // Initialize detectedBy array for all units that can be detected
+                // detectedBy: [] // Initialize empty array
+            };
+
+            // Type-specific properties
             if (assetGroup.type === 'Silo') {
                  unitData.ammo = assetGroup.ammo || 10;
-                 unitData.state = assetGroup.state || 'idle';
-                 unitData.mode = assetGroup.mode || 'OFFENSIVE'; // <<< Add mode
+                 unitData.mode = assetGroup.mode || 'OFFENSIVE';
+            } else if (assetGroup.type === 'Radar') {
+                 unitData.range = assetGroup.range || 20; // Radars use 'range' for their function
+            } else if (assetGroup.type === 'Submarine') {
+                 unitData.ammo = assetGroup.ammo || SUB_SLBM_AMMO;
+                 unitData.submerged = assetGroup.submerged !== undefined ? assetGroup.submerged : true;
             }
-            else if (assetGroup.type === 'Radar') { unitData.range = assetGroup.range || 20; unitData.state = assetGroup.state || 'active'; }
+            // Carrier and Battleship use common + detectionRange
+
             assetsToPlace.push(unitData);
         }
     });
@@ -579,7 +608,10 @@ function placeAIUnits(aiTerritoryKey) {
     // Define the assets the AI gets (can be same or different from player)
     let aiAssetsConfig = [
         { type: 'Silo', count: 3, ammo: 10, mode: 'OFFENSIVE', state: 'idle' },
-        { type: 'Radar', count: 2, range: 25, state: 'active' }
+        { type: 'Radar', count: 2, range: 25, state: 'active' },
+        { type: 'Carrier', count: 1, state: 'idle', detectionRange: CARRIER_DETECTION_RANGE },
+        { type: 'Submarine', count: 2, ammo: SUB_SLBM_AMMO, state: 'idle', submerged: true, detectionRange: SUBMARINE_DETECTION_RANGE },
+        { type: 'Battleship', count: 2, state: 'idle', detectionRange: BATTLESHIP_DETECTION_RANGE }
     ];
 
     let bounds = territories[aiTerritoryKey].placementArea;
@@ -587,29 +619,55 @@ function placeAIUnits(aiTerritoryKey) {
 
     aiAssetsConfig.forEach(assetGroup => {
         for (let i = 0; i < assetGroup.count; i++) {
-            // Find a random valid location within bounds (simple random placement)
-            // Could add checks later to avoid placing units too close together
-            let lon = random(bounds.minLon, bounds.maxLon);
-            let lat = random(bounds.minLat, bounds.maxLat);
+            let placed = false;
+            let placementAttempts = 0;
+            const MAX_PLACEMENT_ATTEMPTS = 100; // Increased attempts for potentially harder placement
+            let isNavalUnit = (assetGroup.type === 'Carrier' || assetGroup.type === 'Submarine' || assetGroup.type === 'Battleship');
 
-            let newUnit = {
-                type: assetGroup.type,
-                owner: aiTerritoryKey,
-                lon: lon,
-                lat: lat,
-                id: `unit_${aiTerritoryKey}_${Date.now()}_${random(1000)}`,
-                ammo: assetGroup.ammo, // Copy specific properties
-                state: assetGroup.state,
-                range: assetGroup.range
-            };
-             // Ensure default state if somehow missed
-             if (!newUnit.state) {
-                 newUnit.state = (newUnit.type === 'Radar' ? 'active' : 'idle');
-             }
+            while (!placed && placementAttempts < MAX_PLACEMENT_ATTEMPTS) {
+                placementAttempts++;
+                let lon = random(bounds.minLon, bounds.maxLon);
+                let lat = random(bounds.minLat, bounds.maxLat);
+                let onLand = isLand(lon, lat); // Check if the random point is on land
 
-            gameUnits.push(newUnit);
-            placedCount++;
-        }
+                // Placement Validity Check:
+                // - Naval units must NOT be on land.
+                // - Land units (Silo, Radar) MUST be on land.
+                if ((isNavalUnit && !onLand) || (!isNavalUnit && onLand)) {
+                    // Valid placement location found
+                    let newUnit = {
+                        type: assetGroup.type,
+                        owner: aiTerritoryKey,
+                        lon: lon, lat: lat,
+                        id: `unit_${aiTerritoryKey}_${Date.now()}_${random(1000)}`,
+                        state: assetGroup.state || 'idle',
+                        detectionRange: assetGroup.detectionRange, // Add detection range
+                        detectedBy: [] // Initialize empty array for detection status
+                    };
+
+                    // Add other type-specific properties
+                    if (assetGroup.type === 'Silo') {
+                        newUnit.ammo = assetGroup.ammo || 10;
+                        newUnit.mode = assetGroup.mode || 'OFFENSIVE';
+                    } else if (assetGroup.type === 'Radar') {
+                        newUnit.range = assetGroup.range || 20; // Radars use 'range'
+                    } else if (assetGroup.type === 'Submarine') {
+                        newUnit.ammo = assetGroup.ammo || SUB_SLBM_AMMO;
+                        newUnit.submerged = assetGroup.submerged !== undefined ? assetGroup.submerged : true;
+                    }
+                    // Carrier and Battleship use common + detectionRange
+
+                    gameUnits.push(newUnit);
+                    placed = true; // Mark as placed
+                    placedCount++;
+                }
+                // If placement was invalid (e.g., naval on land, land on water), the loop continues
+            } // End while placement attempts
+
+            if (!placed) {
+                console.warn(`AI failed to place ${assetGroup.type} for ${aiTerritoryKey} after ${MAX_PLACEMENT_ATTEMPTS} attempts (check land/water constraints).`);
+            }
+        } // End for asset count
     });
     console.log(`Placed ${placedCount} units for AI territory: ${aiTerritoryKey}`);
 }
@@ -989,6 +1047,59 @@ function isCoordInTerritory(lon, lat, territoryKey) {
     let bounds = territories[territoryKey].placementArea;
     return (lon >= bounds.minLon && lon <= bounds.maxLon && lat >= bounds.minLat && lat <= bounds.maxLat);
 }
+// Ray Casting algorithm to check if a point is inside any land polygon
+// Note: This can be computationally intensive if called very frequently.
+// Consider optimizations if performance becomes an issue (e.g., pre-calculating bounding boxes).
+function isLand(lon, lat) {
+    if (!worldGeoJSON || !worldGeoJSON.features) {
+        console.warn("isLand check failed: worldGeoJSON not loaded.");
+        return false; // Default to water if map data is missing
+    }
+
+    let inside = false;
+    for (let feature of worldGeoJSON.features) {
+        let geometry = feature.geometry;
+        if (geometry.type === 'Polygon') {
+            if (pointInPolygon(lon, lat, geometry.coordinates[0])) {
+                return true; // Inside this polygon
+            }
+        } else if (geometry.type === 'MultiPolygon') {
+            for (let polygon of geometry.coordinates) {
+                if (pointInPolygon(lon, lat, polygon[0])) {
+                    return true; // Inside one of the polygons in the multipolygon
+                }
+            }
+        }
+    }
+    return inside; // Not inside any land polygon
+}
+
+// Helper for isLand: Point-in-polygon test (Ray Casting)
+function pointInPolygon(x, y, polygon) {
+    let inside = false;
+    for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+        let xi = polygon[i][0], yi = polygon[i][1];
+        let xj = polygon[j][0], yj = polygon[j][1];
+
+        // Handle longitude wrapping: If the segment crosses the +/- 180 meridian
+        let crossesMeridian = (xi > 150 && xj < -150) || (xi < -150 && xj > 150); // Heuristic check
+
+        // Standard Ray Casting intersection check
+        let intersect = ((yi > y) !== (yj > y))
+            && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+
+        // Adjust intersection check if it crosses the meridian
+        if (crossesMeridian) {
+             // This part is complex and might need refinement depending on GeoJSON structure
+             // For simplicity, we might ignore meridian crossing checks or use a library
+             // A simple approach might be to check both sides if the point is near the meridian
+             // For now, we use the standard check which might fail for polygons crossing the meridian.
+        }
+
+        if (intersect) inside = !inside;
+    }
+    return inside;
+}
 
 function drawUnitGhost(screenX, screenY, type) {
     push();
@@ -1182,16 +1293,20 @@ function drawExplosions() {
 // --- Unit & City Interaction ---
 
 function findClickedUnit(lon, lat, typeFilter = null, ownerFilter = null) {
-    // console.log(`findClickedUnit: Searching near ${lon.toFixed(2)}, ${lat.toFixed(2)}`);
+    // console.log(`findClickedUnit: Searching near ${lon.toFixed(2)}, ${lat.toFixed(2)} for type ${typeFilter}`);
     let clickRadiusDeg = 1.0 / zoom; // Click radius in degrees (adjust as needed)
+    // Make naval units slightly easier to click?
+    if (typeFilter === 'Carrier' || typeFilter === 'Submarine' || typeFilter === 'Battleship') {
+        clickRadiusDeg *= 1.5;
+    }
     let clickRadiusSq = clickRadiusDeg * clickRadiusDeg;
     let closestUnit = null;
     let closestDistSq = Infinity;
 
     for (let unit of gameUnits) {
-        // console.log(`  Checking unit: ${unit.id} (${unit.type}) at ${unit.lon.toFixed(2)}, ${unit.lat.toFixed(2)}`);
-        if (typeFilter && unit.type !== typeFilter) { /*console.log("    -> Type mismatch");*/ continue; }
-        if (ownerFilter && unit.owner !== ownerFilter) { /*console.log("    -> Owner mismatch");*/ continue; }
+        // Apply filters if provided
+        if (typeFilter && unit.type !== typeFilter) continue;
+        if (ownerFilter && unit.owner !== ownerFilter) continue;
 
         let dLon = unit.lon - lon;
         let dLat = unit.lat - lat;
@@ -1329,9 +1444,62 @@ function handleSetupClick() {
 
 function handleGameClick() {
     let clickWorldPos = screenToWorld(mouseX, mouseY);
-    // console.log(`handleGameClick called. World Pos: ${clickWorldPos.lon.toFixed(2)}, ${clickWorldPos.lat.toFixed(2)}. DEFCON: ${currentDefconLevel}`);
 
-    if (true) { // TESTING: Allow at any DEFCON level
+    // --- Priority 1: Issue Command to Selected Naval Unit ---
+    if (selectedNavalUnitId) {
+        let selectedUnit = gameUnits.find(u => u.id === selectedNavalUnitId);
+        if (selectedUnit) {
+            // Check if clicking on an enemy target for attack (TODO)
+            // For now, assume click is a move order
+            let targetCity = findClickedCity(clickWorldPos.lon, clickWorldPos.lat);
+            if (targetCity && targetCity.ownerTerritory !== playerTerritory && selectedUnit.type === 'Submarine') {
+                 // If a Submarine is selected and clicks an enemy city, try to launch SLBM
+                 if (launchSLBM(selectedUnit, targetCity.lon, targetCity.lat, activeMissiles)) {
+                     console.log(`Player ordered SLBM launch from ${selectedUnit.id} at ${targetCity.name}`);
+                     selectedNavalUnitId = null; // Deselect after firing
+                     selectedUnit.state = 'idle'; // Reset state? Or firing state?
+                 } else {
+                     // Launch failed (no ammo, DEFCON too high, etc.) - keep selected
+                     console.log(`SLBM launch failed for ${selectedUnit.id}.`);
+                 }
+            } else {
+                 // Issue move order
+                 if (setNavalUnitDestination(selectedNavalUnitId, clickWorldPos.lon, clickWorldPos.lat, gameUnits)) {
+                     console.log(`Player ordered ${selectedUnit.type} ${selectedNavalUnitId} to move.`);
+                     selectedNavalUnitId = null; // Deselect after issuing move order
+                     selectedUnit.state = 'moving'; // Ensure state is set
+                 } else {
+                     console.warn("Failed to set naval destination."); // Should not happen if unit exists
+                     selectedNavalUnitId = null; // Deselect if something went wrong
+                 }
+            }
+        } else {
+            selectedNavalUnitId = null; // Selected unit somehow disappeared, deselect
+        }
+        return; // Action taken, exit handler
+    }
+
+    // --- Priority 2: Select a Player Naval Unit ---
+    // Use findClickedUnit without type filter first
+    let clickedUnit = findClickedUnit(clickWorldPos.lon, clickWorldPos.lat, null, playerTerritory);
+    if (clickedUnit && (clickedUnit.type === 'Carrier' || clickedUnit.type === 'Submarine' || clickedUnit.type === 'Battleship')) {
+        selectedNavalUnitId = clickedUnit.id;
+        selectedUnitForFiring = null; // Deselect any silo
+        selectedCityForTargeting = null; // Deselect any city target
+        // Update unit state visually? (e.g., add highlight in drawNavalUnits)
+        clickedUnit.state = 'selected'; // Use state for highlighting
+        console.log(`Selected Naval Unit: ${clickedUnit.type} ${clickedUnit.id}`);
+        // Deselect previously selected naval unit if different
+        gameUnits.forEach(u => {
+            if (u.id !== selectedNavalUnitId && (u.type === 'Carrier' || u.type === 'Submarine' || u.type === 'Battleship') && u.state === 'selected') {
+                u.state = 'idle';
+            }
+        });
+        return; // Action taken
+    }
+
+    // --- Priority 3: Handle Silo Firing (Existing Logic) ---
+    if (true) { // Allow firing logic (Original condition: DEFCON level check)
         if (selectedUnitForFiring) { // A silo is already selected, this click is for the target
             let silo = gameUnits.find(u => u.id === selectedUnitForFiring);
             let targetCity = findClickedCity(clickWorldPos.lon, clickWorldPos.lat);
@@ -1339,16 +1507,14 @@ function handleGameClick() {
             if (targetCity && targetCity.ownerTerritory !== playerTerritory) { // Target is a valid enemy/neutral city
                 console.log(`Targeting city: ${targetCity.name}`);
                 selectedCityForTargeting = targetCity.id; // Highlight city
-                // Launch missile on this same click if a city is identified
                 if (silo && silo.ammo > 0) {
                     silo.ammo--;
                     activeMissiles.push({
                         id: `missile_${Date.now()}_${random(1000)}`, owner: silo.owner,
-                        startX: silo.lon, startY: silo.lat, 
-                        targetX: targetCity.lon, targetY: targetCity.lat, // Target city coords
+                        startX: silo.lon, startY: silo.lat,
+                        targetX: targetCity.lon, targetY: targetCity.lat,
                         currentX: silo.lon, currentY: silo.lat, type: 'ICBM',
-                        // *** ADD DETECTION STATUS ***
-                        detected: false // Initially not detected
+                        detected: false
                     });
                     console.log(`Missile launched at ${targetCity.name}! Silo Ammo: ${silo.ammo}`);
                     silo.state = 'idle'; selectedUnitForFiring = null; selectedCityForTargeting = null;
@@ -1361,8 +1527,7 @@ function handleGameClick() {
                     id: `missile_${Date.now()}_${random(1000)}`, owner: silo.owner,
                     startX: silo.lon, startY: silo.lat, targetX: clickWorldPos.lon, targetY: clickWorldPos.lat,
                     currentX: silo.lon, currentY: silo.lat, type: 'ICBM',
-                    // *** ADD DETECTION STATUS ***
-                    detected: false // Initially not detected
+                    detected: false
                 });
                 console.log(`Missile launched at coordinates! Silo Ammo: ${silo.ammo}`);
                 silo.state = 'idle'; selectedUnitForFiring = null; selectedCityForTargeting = null;
@@ -1372,45 +1537,55 @@ function handleGameClick() {
             } else { // Should not happen
                  selectedUnitForFiring = null; selectedCityForTargeting = null;
             }
+            return; // Action taken
 
-        } else { // No silo selected yet, this click is to select a silo or a city (for future info)
+        } else { // No silo selected yet, this click is to select a silo
             let clickedSilo = findClickedUnit(clickWorldPos.lon, clickWorldPos.lat, 'Silo', playerTerritory);
-            // console.log("Clicked Silo result from findClickedUnit:", clickedSilo);
             if (clickedSilo) {
                 if (clickedSilo.ammo > 0) {
                     console.log(`Selected Silo ${clickedSilo.id} (Ammo: ${clickedSilo.ammo}). Click target city or location.`);
+                    // Deselect previously selected silo
                     if(selectedUnitForFiring && selectedUnitForFiring !== clickedSilo.id) {
                         let prevSilo = gameUnits.find(u => u.id === selectedUnitForFiring);
                         if(prevSilo) prevSilo.state = 'idle';
                     }
                     selectedUnitForFiring = clickedSilo.id;
                     clickedSilo.state = 'selected';
-                    selectedCityForTargeting = null; // Clear city target when selecting a new silo
-                    // console.log(`Silo ${clickedSilo.id} state set to: ${clickedSilo.state}`);
+                    selectedCityForTargeting = null; // Clear city target
+                    selectedNavalUnitId = null; // Deselect naval unit
+                    // Deselect previously selected naval unit state
+                    gameUnits.forEach(u => {
+                         if ((u.type === 'Carrier' || u.type === 'Submarine' || u.type === 'Battleship') && u.state === 'selected') {
+                             u.state = 'idle';
+                         }
+                     });
                 } else {
                     console.log(`Selected Silo ${clickedSilo.id} - OUT OF AMMO.`);
                      if(selectedUnitForFiring) { let prevSilo = gameUnits.find(u => u.id === selectedUnitForFiring); if(prevSilo) prevSilo.state = 'idle'; selectedUnitForFiring = null;}
                      selectedCityForTargeting = null;
+                     selectedNavalUnitId = null; // Deselect naval unit
                 }
-            } else { // Click was not on a player silo
-                if(selectedUnitForFiring) { // If a silo was selected, this click might be a target or cancel
-                    // This case is now handled by the (selectedUnitForFiring) block above.
-                    // If we reach here, it means a silo was selected, but this click was not on a valid city target.
-                    // So, we can interpret this as cancelling the silo selection or targeting raw coords.
-                    // The above block already handles raw coord targeting if no city found.
-                    // To cancel selection if clicking empty space:
-                    let silo = gameUnits.find(u => u.id === selectedUnitForFiring);
-                    if(silo) silo.state = 'idle';
-                    selectedUnitForFiring = null;
-                    selectedCityForTargeting = null;
-                    console.log("Firing cancelled by clicking empty space.");
-                } else {
-                    // No silo selected, and no silo clicked. Could be for city info in future.
-                    selectedCityForTargeting = null; // Clear city target if clicking elsewhere
-                }
+                return; // Action taken
             }
         }
-    } 
+    }
+
+    // --- Priority 4: Clicked on empty space (Deselect everything) ---
+    if (selectedUnitForFiring) {
+        let silo = gameUnits.find(u => u.id === selectedUnitForFiring);
+        if(silo) silo.state = 'idle';
+        selectedUnitForFiring = null;
+        selectedCityForTargeting = null;
+        console.log("Firing cancelled / Silo deselected.");
+    }
+    if (selectedNavalUnitId) {
+         let navalUnit = gameUnits.find(u => u.id === selectedNavalUnitId);
+         if(navalUnit) navalUnit.state = 'idle'; // Reset state
+         selectedNavalUnitId = null;
+         console.log("Naval unit deselected.");
+    }
+    selectedCityForTargeting = null; // Always clear city target if clicking empty space
+
 }
 
 
@@ -1505,6 +1680,79 @@ function keyPressed() {
                 }
             }
         }
+    } else if (keyCode === 70) { // 'F' key for manual ABM fire
+        handleManualABMFire();
+function handleManualABMFire() {
+    if (gameState !== 'Playing') return;
+
+    let mouseWorldPos = screenToWorld(mouseX, mouseY);
+    let closestMissile = null;
+    let minDistSqMissile = Infinity;
+    const MAX_MANUAL_TARGET_DIST_DEG = 10; // How close cursor needs to be to a missile (world degrees)
+
+    // 1. Find closest detected enemy missile near cursor
+    for (let missile of activeMissiles) {
+        if (missile.owner !== playerTerritory && missile.detected) {
+            let dLonM = missile.currentX - mouseWorldPos.lon;
+            let dLatM = missile.currentY - mouseWorldPos.lat;
+            let distSqM = dLonM*dLonM + dLatM*dLatM;
+            if (distSqM < MAX_MANUAL_TARGET_DIST_DEG * MAX_MANUAL_TARGET_DIST_DEG && distSqM < minDistSqMissile) {
+                minDistSqMissile = distSqM;
+                closestMissile = missile;
+            }
+        }
+    }
+
+    if (!closestMissile) {
+        console.log("Manual ABM Fire: No detected enemy missile near cursor.");
+        return;
+    }
+
+    if (isActiveABMTarget(closestMissile.id)) {
+        console.log(`Manual ABM Fire: Missile ${closestMissile.id} is already targeted.`);
+        return;
+    }
+
+    // 2. Find closest available defensive silo near cursor
+    let closestSilo = null;
+    let minDistSqSilo = Infinity;
+    const MAX_MANUAL_SILO_DIST_DEG = 15; // How close cursor needs to be to a silo
+
+    for (let silo of gameUnits) {
+        if (silo.owner === playerTerritory &&
+            silo.type === 'Silo' &&
+            silo.mode === 'DEFENSIVE' &&
+            silo.ammo > 0 &&
+            silo.state === 'idle') { // Consider only idle silos for manual fire?
+
+            let dLonS = silo.lon - mouseWorldPos.lon;
+            let dLatS = silo.lat - mouseWorldPos.lat;
+            let distSqS = dLonS*dLonS + dLatS*dLatS;
+            if (distSqS < MAX_MANUAL_SILO_DIST_DEG * MAX_MANUAL_SILO_DIST_DEG && distSqS < minDistSqSilo) {
+                minDistSqSilo = distSqS;
+                closestSilo = silo;
+            }
+        }
+    }
+
+    if (!closestSilo) {
+        console.log("Manual ABM Fire: No available defensive silo near cursor.");
+        return;
+    }
+
+    // 3. Launch ABM
+    console.log(`MANUAL DEFENSE: Silo ${closestSilo.id} launching ABM at Missile ${closestMissile.id} via 'F' key.`);
+    closestSilo.ammo--;
+    // closestSilo.state = 'reloading'; // Optional cooldown
+    activeABMs.push({
+        id: `abm_${Date.now()}_${random(1000)}`,
+        owner: playerTerritory,
+        siloId: closestSilo.id,
+        startX: closestSilo.lon, startY: closestSilo.lat,
+        targetMissileId: closestMissile.id,
+        currentX: closestSilo.lon, currentY: closestSilo.lat
+    });
+}
     }
 }
 
