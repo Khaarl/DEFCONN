@@ -1,5 +1,4 @@
-// sketch.js - Updated with Damage Calculation, Scoring, and City Targeting Logic
-
+// sketch.js - Updated with Radar Functionality
 let worldGeoJSON;
 let citiesGeoJSON;
 
@@ -46,18 +45,18 @@ let territories = {
     }
 };
 let playerTerritory = null; // Key of the player's territory
-let gameUnits = []; // Holds all placed units { type, owner, lon, lat, id, ammo?, state? }
+let gameUnits = []; // Holds all placed units { type, owner, lon, lat, id, ammo?, state?, range? }
 let selectedUnitForFiring = null; // ID of the silo selected for firing
 let gameCities = []; // Simplified list for quick lookup: { name, lon, lat, population, initialPopulation, ownerTerritory, destroyed: false, id, state? }
 let selectedCityForTargeting = null; // ID of city selected for targeting
 
 
 // Missile & Effects Data
-let activeMissiles = []; // { id, owner, startX, startY, targetX, targetY, currentX, currentY, type }
+let activeMissiles = []; // { id, owner, startX, startY, targetX, targetY, currentX, currentY, type, detected }
 let activeExplosions = []; // { x, y, radius, maxRadius, duration, age, owner }
-const MISSILE_WORLD_SPEED_DEG_PER_SEC = 5.0; 
-const CITY_IMPACT_RADIUS_DEG = 1.0; 
-const UNIT_IMPACT_RADIUS_DEG = 0.5; 
+const MISSILE_WORLD_SPEED_DEG_PER_SEC = 5.0;
+const CITY_IMPACT_RADIUS_DEG = 1.0;
+const UNIT_IMPACT_RADIUS_DEG = 0.5;
 const MEGADEATHS_PER_NUKE = 2.5;
 
 // Game Progression Variables
@@ -65,7 +64,7 @@ let currentDefconLevel = 5;
 let gameStartTime = 0;
 let elapsedGameTime = 0;
 const DEFCON_TIMINGS = { 4: 180, 3: 360, 2: 540, 1: 720 };
-let scores = {}; 
+let scores = {};
 
 
 // Setup Phase Variables
@@ -85,9 +84,9 @@ const MENU_HIGHLIGHT_COLOR = [255, 255, 0]; // Yellow
 const CITY_TARGET_HIGHLIGHT_COLOR = [255, 0, 0, 150]; // Red for target
 const MENU_TITLE_COLOR = [0, 255, 255];
 const MENU_BG_ALPHA = 180;
-const POP_TIER1_THRESHOLD = 1000000; 
-const POP_TIER2_THRESHOLD = 5000000; 
-const POP_TIER3_THRESHOLD = 10000000; 
+const POP_TIER1_THRESHOLD = 1000000;
+const POP_TIER2_THRESHOLD = 5000000;
+const POP_TIER3_THRESHOLD = 10000000;
 const LABEL_ZOOM_THRESHOLD = 4.0;
 const BASE_WORLD_WIDTH = 2048;
 const BASE_WORLD_HEIGHT = BASE_WORLD_WIDTH / 2;
@@ -269,12 +268,13 @@ function drawSetupScreen() {
 
 function drawGameScreen() {
     updateGameTimeAndDefcon();
+    updateDetection(); // <<< CALL DETECTION LOGIC HERE
     updateMissiles();
-    drawBackgroundMapAndCities(); 
+    drawBackgroundMapAndCities();
     gameUnits.forEach(unit => { drawUnit(unit); });
-    drawMissiles();
+    drawMissiles(); // Will be modified next
     drawExplosions();
-    drawGameUIOverlay(); 
+    drawGameUIOverlay();
 }
 
 function drawGameUIOverlay() {
@@ -371,12 +371,24 @@ function initializeGameSetup(territoryKey) {
         console.log(`Added ${gameCities.length} cities to gameCities (pop >= ${POP_TIER1_THRESHOLD}). ${processedCount} assigned to specific territories. ${unownedCount} initially unassigned from main territories (now Neutral).`);
     }
 
-    let initialAssets = [ { type: 'Silo', count: 3 }, { type: 'Radar', count: 2 } ];
+    // Define initial assets with radar properties
+    let initialAssets = [
+        { type: 'Silo', count: 3 },
+        // *** ADD RADAR DETAILS HERE ***
+        { type: 'Radar', count: 2, range: 25, state: 'active' } // Example range in degrees, initial state active
+    ];
     assetsToPlace = [];
     initialAssets.forEach(assetGroup => {
         for(let i = 0; i < assetGroup.count; i++) {
             let unitData = { type: assetGroup.type };
-            if (assetGroup.type === 'Silo') { unitData.ammo = 10; unitData.state = 'idle'; }
+            if (assetGroup.type === 'Silo') {
+                unitData.ammo = 10; unitData.state = 'idle';
+            }
+            // *** COPY RADAR DETAILS ***
+            else if (assetGroup.type === 'Radar') {
+                unitData.range = assetGroup.range || 20; // Default range if not specified
+                unitData.state = assetGroup.state || 'active'; // Default state
+            }
             assetsToPlace.push(unitData);
         }
     });
@@ -397,6 +409,47 @@ function updateGameTimeAndDefcon() {
         console.log(`DEFCON LEVEL ${currentDefconLevel} REACHED at ${elapsedGameTime.toFixed(0)}s`);
     }
 }
+
+// Create this new function
+function updateDetection() {
+    if (gameState !== 'Playing') return;
+
+    // Reset detection each frame? Or keep persistent? Let's try persistent.
+    // For persistent: iterate through missiles and check if they are *currently* inside range.
+    // For simplicity now: If detected once, stays detected.
+
+    // Iterate through all player radar stations
+    for (let radar of gameUnits) {
+        // Check if it's an active player radar
+        if (radar.type === 'Radar' && radar.owner === playerTerritory && radar.state === 'active') {
+            // Check against all active enemy missiles
+            for (let missile of activeMissiles) {
+                // Only detect missiles owned by OTHER territories AND not already detected
+                if (missile.owner !== playerTerritory && !missile.detected) {
+                    // Check distance (using squared distance for efficiency)
+                    let dLon = radar.lon - missile.currentX;
+                    let dLat = radar.lat - missile.currentY;
+                    let distSq = dLon*dLon + dLat*dLat;
+                    // Convert radar range (degrees) to squared degrees for comparison
+                    // This assumes a flat projection locally, which is inaccurate over large distances but okay for game purposes
+                    let rangeSq = radar.range * radar.range;
+
+                    if (distSq < rangeSq) {
+                        missile.detected = true; // Mark as detected by the player
+                        console.log(`Radar ${radar.id} detected enemy missile ${missile.id}`);
+                    }
+                }
+            }
+            // TODO: Add detection logic for other enemy units (bombers, subs) when they are implemented
+        }
+    }
+
+    // --- Placeholder for AI Detection ---
+    // Iterate through AI radars (when AI exists)
+    // Check against player missiles
+    // Set missile.detected = true (or missile.detectedByAI = true)
+}
+
 
 function updateMissiles() {
     if (activeMissiles.length === 0) return;
@@ -437,14 +490,29 @@ function handleMissileImpact(missile) {
             if (scores[city.ownerTerritory]) scores[city.ownerTerritory].suffered += casualties; else console.error("Defender score object missing for: " + city.ownerTerritory);
         }
     }
+    // --- Unit Hit Check ---
     for (let i = gameUnits.length - 1; i >= 0; i--) {
         let unit = gameUnits[i];
-        if (unit.owner === missile.owner) continue;
+        // Skip own units and units already destroyed (if applicable)
+        if (unit.owner === missile.owner || unit.state === 'destroyed') continue;
+
         let dLon = unit.lon - missile.targetX; let dLat = unit.lat - missile.targetY;
         let distSq = dLon*dLon + dLat*dLat;
+
         if (distSq < UNIT_IMPACT_RADIUS_DEG * UNIT_IMPACT_RADIUS_DEG) {
             console.log(`>>> Missile ${missile.id} HIT Enemy Unit: ${unit.type} ${unit.id} (Owner: ${unit.owner})`);
-            gameUnits.splice(i, 1); unitsDestroyedThisImpact++;
+
+            // *** MODIFY RADAR DESTRUCTION ***
+            if (unit.type === 'Radar') {
+                 unit.state = 'destroyed'; // Mark radar as destroyed/inactive
+                 console.log(`    Radar ${unit.id} state set to destroyed.`);
+                 unitsDestroyedThisImpact++; // Still count it as a "destroyed" unit impact
+            } else {
+                 // For silos or other units, remove them entirely for now
+                 gameUnits.splice(i, 1);
+                 unitsDestroyedThisImpact++;
+            }
+            // Optional scoring updates...
         }
     }
     if (megadeathsInflictedThisImpact > 0) console.log(`   Total Megadeaths this impact: ${megadeathsInflictedThisImpact.toFixed(2)}`);
@@ -494,143 +562,226 @@ function isCoordInTerritory(lon, lat, territoryKey) {
 
 function drawUnitGhost(screenX, screenY, type) {
     push();
-    if (type === 'Silo') { fill(0, 255, 0, 100); noStroke(); let size = 10 + zoom; triangle(screenX, screenY - size*0.6, screenX - size*0.4, screenY + size*0.4, screenX + size*0.4, screenY + size*0.4); }
-    else if (type === 'Radar') { fill(0, 150, 255, 100); noStroke(); let size = 12 + zoom; ellipse(screenX, screenY, size, size); stroke(0, 150, 255, 100); strokeWeight(1); line(screenX, screenY, screenX + size*0.7, screenY - size*0.7); }
+    if (type === 'Silo') { 
+        fill(0, 255, 0, 100); 
+        noStroke(); 
+        let size = 10 + zoom; 
+        triangle(screenX, screenY - size*0.6, screenX - size*0.4, screenY + size*0.4, screenX + size*0.4, screenY + size*0.4); 
+    } else if (type === 'Radar') { 
+        let size = 12 + zoom; 
+        // Draw ellipse first
+        fill(0, 150, 255, 100); 
+        noStroke(); 
+        ellipse(screenX, screenY, size, size); 
+        // Then set stroke and draw line
+        stroke(0, 150, 255, 100); 
+        strokeWeight(1); 
+        line(screenX, screenY, screenX + size*0.5, screenY - size*0.5); // Adjusted line slightly to match drawUnit
+    }
     pop();
 }
 
 function drawUnit(unit, isSetupPhase = false) {
     let screenPos = worldToScreen(unit.lon, unit.lat); push();
-    let unitColor = (territories[unit.owner] && territories[unit.owner].color) ? territories[unit.owner].color : [128,128,128,200]; 
+    let unitColor = (territories[unit.owner] && territories[unit.owner].color) ? territories[unit.owner].color : [128,128,128,200];
     let strokeColor = unitColor; let showHighlight = false;
+
     if (isSetupPhase) { unitColor = [unitColor[0], unitColor[1], unitColor[2], 150]; }
     else if (unit.state === 'selected' || selectedUnitForFiring === unit.id) { showHighlight = true; strokeColor = [255, 255, 0]; }
     else if (unit.type === 'Silo' && unit.ammo === 0) { unitColor = [100, 100, 100, 150]; strokeColor = [100, 100, 100, 150]; }
+    // *** ADD check for destroyed state for radars ***
+    else if (unit.type === 'Radar' && unit.state === 'destroyed') { unitColor = [100, 100, 100, 150]; strokeColor = [100, 100, 100, 150]; }
+
     if (showHighlight) { noFill(); stroke(strokeColor[0], strokeColor[1], strokeColor[2], 200); strokeWeight(max(1.5, 2.5 / zoom)); let r = (unit.type === 'Silo' ? 10 : 12) + zoom; r = max(8, r); ellipse(screenPos.x, screenPos.y, r * 2); }
+
+    // --- Draw Base Unit Icons ---
     if (unit.type === 'Silo') {
         fill(unitColor); stroke(strokeColor); strokeWeight(max(0.5, 1 / zoom)); let size = 8 + zoom * 0.5; size = max(4, size);
         triangle(screenPos.x, screenPos.y - size*0.6, screenPos.x - size*0.4, screenPos.y + size*0.4, screenPos.x + size*0.4, screenPos.y + size*0.4);
         if (unit.ammo > 0 && zoom > 1.5 && !isSetupPhase) { fill(255); textSize(max(6, 8 + zoom*0.2)); textAlign(CENTER, TOP); noStroke(); text(unit.ammo, screenPos.x, screenPos.y + size*0.5); }
     } else if (unit.type === 'Radar') {
-        fill(unitColor); stroke(strokeColor); strokeWeight(max(0.5, 1 / zoom)); let size = 10 + zoom * 0.5; size = max(5, size);
-        ellipse(screenPos.x, screenPos.y, size, size); stroke(unitColor); strokeWeight(max(1, 1 / zoom)); line(screenPos.x, screenPos.y, screenPos.x + size*0.5, screenPos.y - size*0.5);
+        let size = 10 + zoom * 0.5; size = max(5, size);
+        if(unit.state === 'destroyed') {
+            // *** Draw Destroyed Radar ***
+             fill(unitColor); // Greyed out color set above
+             stroke(strokeColor); strokeWeight(max(0.5, 1 / zoom));
+             ellipse(screenPos.x, screenPos.y, size, size);
+             stroke(150,0,0, 200); strokeWeight(max(1, 1.5/zoom)); // Red X
+             line(screenPos.x-size*0.5, screenPos.y-size*0.5, screenPos.x+size*0.5, screenPos.y+size*0.5);
+             line(screenPos.x-size*0.5, screenPos.y+size*0.5, screenPos.x+size*0.5, screenPos.y-size*0.5);
+        } else {
+            // *** Draw Active Radar ***
+            fill(unitColor); stroke(strokeColor); strokeWeight(max(0.5, 1 / zoom));
+            ellipse(screenPos.x, screenPos.y, size, size);
+            stroke(unitColor); strokeWeight(max(1, 1 / zoom)); line(screenPos.x, screenPos.y, screenPos.x + size*0.5, screenPos.y - size*0.5); // Dish
+
+             // *** Draw Radar Range Circle (Optional) ***
+             if (unit.owner === playerTerritory && !isSetupPhase && zoom > 1.2 && unit.range) { // Check unit.range exists
+                 let rangeInDegrees = unit.range;
+                 // Estimate screen distance: This is tricky with map projections.
+                 // A simple approach: find a point 'range' degrees east and measure screen distance.
+                 // This is inaccurate near poles or dateline but might suffice visually.
+                 let edgePointLon = unit.lon + rangeInDegrees;
+                 // Simple wrap around dateline for visualization
+                 if (edgePointLon > 180) edgePointLon -= 360;
+                 if (edgePointLon < -180) edgePointLon += 360;
+
+                 let edgePoint = worldToScreen(edgePointLon, unit.lat);
+                 let screenRange = dist(screenPos.x, screenPos.y, edgePoint.x, edgePoint.y);
+
+                 // Alternative: Approximate degrees to pixels at current zoom/center (less accurate)
+                 // let approxDegPerPixel = (screenToWorld(width/2 + 10, height/2).lon - screenToWorld(width/2, height/2).lon) / 10;
+                 // let screenRange = rangeInDegrees / approxDegPerPixel;
+
+
+                 noFill();
+                 stroke(0, 100, 150, 80); // Faint blue radar circle
+                 strokeWeight(max(0.5, 1 / zoom));
+                 ellipse(screenPos.x, screenPos.y, screenRange * 2);
+             }
+        }
     }
     pop();
 }
 
 function drawMissiles() {
-    push(); strokeWeight(max(1, 2 / zoom));
+    push();
+    strokeWeight(max(1, 2 / zoom));
+
     for (let m of activeMissiles) {
-        let startScreen = worldToScreen(m.startX, m.startY); let currentScreen = worldToScreen(m.currentX, m.currentY);
-        let trailColor = (territories[m.owner] && territories[m.owner].color) ? territories[m.owner].color : [128,128,128,180];
-        stroke(trailColor[0], trailColor[1], trailColor[2], 180);
-        line(startScreen.x, startScreen.y, currentScreen.x, currentScreen.y);
-        noStroke(); fill(255, 255, 0); let headSize = max(3, 6 / zoom); ellipse(currentScreen.x, currentScreen.y, headSize, headSize);
+        let startScreen = worldToScreen(m.startX, m.startY);
+        let currentScreen = worldToScreen(m.currentX, m.currentY);
+        let isEnemy = m.owner !== playerTerritory;
+        let isDetected = m.detected; // Use the missile's detected property
+        let drawFull = false; // Default to not drawing clearly
+
+        if (m.owner === playerTerritory) {
+             drawFull = true; // Always draw player's own missiles fully
+        } else { // It's an enemy missile
+            if (isDetected) {
+                 drawFull = true; // Draw detected enemy missiles fully
+            } else {
+                 drawFull = false; // Undetected enemy missiles are drawn faintly or not at all
+            }
+        }
+
+        if (drawFull) {
+            // --- Draw Trail ---
+            let trailColorAlpha = (isEnemy && isDetected) ? 220 : 180; // Make detected enemy trail slightly more opaque?
+            let trailColor = (territories[m.owner] && territories[m.owner].color) ? territories[m.owner].color : [128,128,128,180];
+            stroke(trailColor[0], trailColor[1], trailColor[2], trailColorAlpha);
+            line(startScreen.x, startScreen.y, currentScreen.x, currentScreen.y);
+
+            // --- Draw Missile Head ---
+            noStroke();
+            let headColor = [255, 255, 0]; // Default Yellow
+            if (isEnemy && isDetected) {
+                headColor = [255, 100, 0]; // Orange head for detected enemy
+            }
+            fill(headColor[0], headColor[1], headColor[2]);
+            let headSize = max(3, 6 / zoom);
+            ellipse(currentScreen.x, currentScreen.y, headSize, headSize);
+        } else if (isEnemy && !isDetected) {
+             // Optional: Draw undetected enemy missiles very faintly
+             /*
+             stroke(100, 100, 100, 50); // Very faint grey trail
+             line(startScreen.x, startScreen.y, currentScreen.x, currentScreen.y);
+             fill(150, 150, 150, 80); // Faint grey head
+             noStroke();
+             let headSize = max(2, 4 / zoom);
+             ellipse(currentScreen.x, currentScreen.y, headSize, headSize);
+             */
+        }
     }
     pop();
 }
 
 function drawExplosions() {
-    if (activeExplosions.length === 0) return; push(); noStroke();
+    push();
+    noStroke();
     for (let i = activeExplosions.length - 1; i >= 0; i--) {
-        let exp = activeExplosions[i]; exp.age++;
-        if (exp.age > exp.duration) { activeExplosions.splice(i, 1); continue; }
+        let exp = activeExplosions[i];
         let screenPos = worldToScreen(exp.x, exp.y);
-        let currentRadius = map(exp.age, 0, exp.duration, 0, exp.maxRadius);
-        let screenRadius = currentRadius * zoom * (BASE_WORLD_WIDTH / 360); 
-        let lifeRatio = exp.age / exp.duration;
-        let alpha = map(lifeRatio, 0.5, 1.0, 255, 0, true);
-        let r = 255; let g = map(lifeRatio, 0, 0.7, 255, 0, true); let b = 0;
-        fill(r, g, b, alpha); ellipse(screenPos.x, screenPos.y, screenRadius * 2);
+        exp.age++;
+        if (exp.age > exp.duration) { activeExplosions.splice(i, 1); continue; }
+        let progress = exp.age / exp.duration;
+        let currentRadius = lerp(0, exp.maxRadius, pow(progress, 0.5)); // Grow fast, fade slow
+        let alpha = lerp(255, 0, pow(progress, 1.5));
+        let size = currentRadius * zoom * 10; // Adjust multiplier for visual scale
+        size = max(1, size);
+        fill(255, lerp(255, 100, progress), 0, alpha);
+        ellipse(screenPos.x, screenPos.y, size, size);
     }
     pop();
 }
 
-// --- Event Handlers ---
+// --- Unit & City Interaction ---
 
 function findClickedUnit(lon, lat, typeFilter = null, ownerFilter = null) {
-    let clickScreenPos = worldToScreen(lon, lat);
+    // console.log(`findClickedUnit: Searching near ${lon.toFixed(2)}, ${lat.toFixed(2)}`);
+    let clickRadiusDeg = 1.0 / zoom; // Click radius in degrees (adjust as needed)
+    let clickRadiusSq = clickRadiusDeg * clickRadiusDeg;
     let closestUnit = null;
-    let minScreenDistanceSq = 15 * 15; 
-
-    // console.log(`findClickedUnit: Checking at screen (${clickScreenPos.x.toFixed(1)}, ${clickScreenPos.y.toFixed(1)}) for type: ${typeFilter}`); 
+    let closestDistSq = Infinity;
 
     for (let unit of gameUnits) {
-        if (typeFilter && unit.type !== typeFilter) continue;
-        if (ownerFilter && unit.owner !== ownerFilter) continue;
+        // console.log(`  Checking unit: ${unit.id} (${unit.type}) at ${unit.lon.toFixed(2)}, ${unit.lat.toFixed(2)}`);
+        if (typeFilter && unit.type !== typeFilter) { /*console.log("    -> Type mismatch");*/ continue; }
+        if (ownerFilter && unit.owner !== ownerFilter) { /*console.log("    -> Owner mismatch");*/ continue; }
 
-        let unitScreenPos = worldToScreen(unit.lon, unit.lat);
-        let screenDSq = distSq(clickScreenPos.x, clickScreenPos.y, unitScreenPos.x, unitScreenPos.y);
+        let dLon = unit.lon - lon;
+        let dLat = unit.lat - lat;
+        let distSq = dLon * dLon + dLat * dLat;
+        // console.log(`    Distance squared: ${distSq.toFixed(4)} (Radius squared: ${clickRadiusSq.toFixed(4)})`);
 
-        // console.log(`findClickedUnit: Checking ${unit.type} ${unit.id} at screen (${unitScreenPos.x.toFixed(1)}, ${unitScreenPos.y.toFixed(1)}), distSq: ${screenDSq.toFixed(1)} vs minScreenDistanceSq: ${minScreenDistanceSq}`); 
-        
-        if (screenDSq < minScreenDistanceSq) {
-            // console.log(`findClickedUnit: Potential unit ${unit.id} (distSq: ${screenDSq})`); 
-            minScreenDistanceSq = screenDSq;
+        if (distSq < clickRadiusSq && distSq < closestDistSq) {
+            // console.log(`    -> Found potential match: ${unit.id}`);
             closestUnit = unit;
+            closestDistSq = distSq;
         }
     }
-
-    // if (closestUnit) {
-    //     console.log(`findClickedUnit: Returning unit: ${closestUnit.id}`); 
-    // } else {
-    //     console.log("findClickedUnit: No unit found in click radius."); 
-    // }
+    // console.log("  -> findClickedUnit returning:", closestUnit ? closestUnit.id : null);
     return closestUnit;
 }
 
 function findClickedCity(lon, lat) {
-    let clickScreenPos = worldToScreen(lon, lat);
+    let clickRadiusDeg = 1.0 / zoom; // Click radius in degrees
+    let clickRadiusSq = clickRadiusDeg * clickRadiusDeg;
     let closestCity = null;
-    let minScreenDistanceSq = 20 * 20; // Slightly larger click radius for cities
-
-    // console.log(`findClickedCity: Checking at screen (${clickScreenPos.x.toFixed(1)}, ${clickScreenPos.y.toFixed(1)})`);
+    let closestDistSq = Infinity;
 
     for (let city of gameCities) {
-        if (city.destroyed) continue; // Cannot target destroyed cities
+        if (city.destroyed) continue; // Ignore destroyed cities
 
-        let cityScreenPos = worldToScreen(city.lon, city.lat);
-        let screenDSq = distSq(clickScreenPos.x, clickScreenPos.y, cityScreenPos.x, cityScreenPos.y);
+        let dLon = city.lon - lon;
+        let dLat = city.lat - lat;
+        let distSq = dLon * dLon + dLat * dLat;
 
-        // console.log(`findClickedCity: Checking ${city.name} at screen (${cityScreenPos.x.toFixed(1)}, ${cityScreenPos.y.toFixed(1)}), distSq: ${screenDSq.toFixed(1)}`);
-
-        if (screenDSq < minScreenDistanceSq) {
-            minScreenDistanceSq = screenDSq;
+        if (distSq < clickRadiusSq && distSq < closestDistSq) {
             closestCity = city;
+            closestDistSq = distSq;
         }
     }
-    // if (closestCity) {
-    //     console.log(`findClickedCity: Returning city: ${closestCity.name}`);
-    // } else {
-    //     console.log("findClickedCity: No city found in click radius.");
-    // }
     return closestCity;
 }
 
 
-function distSq(x1, y1, x2, y2) { 
-    return (x1 - x2)**2 + (y1 - y2)**2;
-}
+// --- Input Handling ---
 
 function mousePressed() {
-    if (mouseButton === LEFT) {
-        initialMouseX = mouseX;
-        initialMouseY = mouseY;
+    initialMouseX = mouseX; initialMouseY = mouseY;
+    prevMouseX = mouseX; // Initialize prevMouse for drag calculation
+    prevMouseY = mouseY; // Initialize prevMouse for drag calculation
+    isDragging = false; // Reset drag flag on new press
 
-        if (gameState === 'MainMenu') { handleMainMenuClick(); }
-        else if (gameState === 'Options') { handleOptionsClick(); handleVolumeClick(); }
-        else if (gameState === 'Setup') { handleSetupClick(); }
-        else if (gameState === 'Playing') {
-            if (mouseX > 0 && mouseX < width && mouseY > 0 && mouseY < height) {
-                isDragging = true;
-                prevMouseX = mouseX;
-                prevMouseY = mouseY;
-            } else {
-                isDragging = false;
-            }
-        } else {
-             isDragging = false;
-        }
+    if (gameState === 'MainMenu') {
+        handleMainMenuClick();
+    } else if (gameState === 'Options') {
+        handleOptionsClick();
+    } else if (gameState === 'Setup') {
+        handleSetupClick();
+    } else if (gameState === 'Playing') {
+        handleGameClick();
     }
 }
 
@@ -646,22 +797,26 @@ function handleVolumeClick() {
            else if (selectedOption === 1) musicVolume = newVolume;
            else if (selectedOption === 2) sfxVolume = newVolume;
         }
-   }
+    }
 }
 
 function handleMainMenuClick() {
-    if (selectedOption !== -1) {
-        let choice = mainMenuOptions[selectedOption];
-        if (choice === "START SIMULATION") { initializeGameSetup("NorthAmerica"); gameState = 'Setup'; }
-        else if (choice === "OPTIONS") { gameState = 'Options'; selectedOption = -1; }
-        else if (choice === "EXIT") { console.log("Exit selected"); }
+    if (selectedOption === 0) { // START
+        gameState = 'Setup';
+        initializeGameSetup("NorthAmerica"); // Default to North America for now
+    } else if (selectedOption === 1) { // OPTIONS
+        gameState = 'Options';
+    } else if (selectedOption === 2) { // EXIT
+        // In a browser context, we can't truly exit. Maybe go back to a blank screen or show a message.
+        console.log("Exit selected (no action in browser)");
     }
 }
 
 function handleOptionsClick() {
-    if (selectedOption !== -1) {
-        let choice = optionsMenuOptions[selectedOption];
-        if (choice === "BACK") { gameState = 'MainMenu'; selectedOption = -1; }
+    if (selectedOption === 3) { // BACK
+        gameState = 'MainMenu';
+    } else {
+        handleVolumeClick(); // Handle clicks on the volume bars/values
     }
 }
 
@@ -671,16 +826,33 @@ function handleSetupClick() {
             let mouseWorld = screenToWorld(mouseX, mouseY);
             if (isCoordInTerritory(mouseWorld.lon, mouseWorld.lat, playerTerritory)) {
                 let assetData = assetsToPlace[currentPlacementIndex];
-                gameUnits.push({
-                    type: assetData.type, owner: playerTerritory, lon: mouseWorld.lon, lat: mouseWorld.lat,
-                    id: `unit_${Date.now()}_${random(1000)}`, ammo: assetData.ammo, state: assetData.state
-                });
+                // Create the new unit object with explicit defaults
+                let newUnit = {
+                    type: assetData.type,
+                    owner: playerTerritory,
+                    lon: mouseWorld.lon,
+                    lat: mouseWorld.lat,
+                    id: `unit_${Date.now()}_${random(1000)}`,
+                    // Set properties based on type, defaulting others to null
+                    ammo: (assetData.type === 'Silo' ? assetData.ammo : null),
+                    state: assetData.state, // State is set during initialization for both
+                    range: (assetData.type === 'Radar' ? assetData.range : null)
+                };
+                 // Ensure default state if somehow missed during initialization
+                 if (!newUnit.state) {
+                     newUnit.state = (newUnit.type === 'Radar' ? 'active' : 'idle');
+                 }
+
+                gameUnits.push(newUnit);
                 currentPlacementIndex++;
             } else { console.log("Cannot place outside territory."); }
-        } else {
-            console.log("Deployment Confirmed!"); setupConfirmed = true; gameState = 'Playing';
-            gameStartTime = millis(); elapsedGameTime = 0; currentDefconLevel = 5;
-        }
+        } else { 
+            // Confirmation logic
+            setupConfirmed = true; gameState = 'Playing'; gameStartTime = millis();
+            console.log("Setup confirmed. Game starting!");
+            console.log("Current Units:", gameUnits);
+            console.log("Current Cities:", gameCities);
+         }
     }
 }
 
@@ -703,7 +875,9 @@ function handleGameClick() {
                         id: `missile_${Date.now()}_${random(1000)}`, owner: silo.owner,
                         startX: silo.lon, startY: silo.lat, 
                         targetX: targetCity.lon, targetY: targetCity.lat, // Target city coords
-                        currentX: silo.lon, currentY: silo.lat, type: 'ICBM'
+                        currentX: silo.lon, currentY: silo.lat, type: 'ICBM',
+                        // *** ADD DETECTION STATUS ***
+                        detected: false // Initially not detected
                     });
                     console.log(`Missile launched at ${targetCity.name}! Silo Ammo: ${silo.ammo}`);
                     silo.state = 'idle'; selectedUnitForFiring = null; selectedCityForTargeting = null;
@@ -715,7 +889,9 @@ function handleGameClick() {
                  activeMissiles.push({
                     id: `missile_${Date.now()}_${random(1000)}`, owner: silo.owner,
                     startX: silo.lon, startY: silo.lat, targetX: clickWorldPos.lon, targetY: clickWorldPos.lat,
-                    currentX: silo.lon, currentY: silo.lat, type: 'ICBM'
+                    currentX: silo.lon, currentY: silo.lat, type: 'ICBM',
+                    // *** ADD DETECTION STATUS ***
+                    detected: false // Initially not detected
                 });
                 console.log(`Missile launched at coordinates! Silo Ammo: ${silo.ammo}`);
                 silo.state = 'idle'; selectedUnitForFiring = null; selectedCityForTargeting = null;
@@ -752,11 +928,11 @@ function handleGameClick() {
                     // So, we can interpret this as cancelling the silo selection or targeting raw coords.
                     // The above block already handles raw coord targeting if no city found.
                     // To cancel selection if clicking empty space:
-                    // let silo = gameUnits.find(u => u.id === selectedUnitForFiring);
-                    // if(silo) silo.state = 'idle';
-                    // selectedUnitForFiring = null;
-                    // selectedCityForTargeting = null;
-                    // console.log("Firing cancelled by clicking empty space.");
+                    let silo = gameUnits.find(u => u.id === selectedUnitForFiring);
+                    if(silo) silo.state = 'idle';
+                    selectedUnitForFiring = null;
+                    selectedCityForTargeting = null;
+                    console.log("Firing cancelled by clicking empty space.");
                 } else {
                     // No silo selected, and no silo clicked. Could be for city info in future.
                     selectedCityForTargeting = null; // Clear city target if clicking elsewhere
@@ -768,56 +944,60 @@ function handleGameClick() {
 
 
 function mouseDragged() {
-    if (gameState === 'Options' && selectedOption >= 0 && selectedOption < 3) {
-        let vol = (selectedOption === 0 ? masterVolume : (selectedOption === 1 ? musicVolume : sfxVolume));
-        let displayValue = `[ ${nf(vol, 0, 0)}% ]`;
-        let sliderStartX = width * 0.65 + textWidth(displayValue) + 10;
-        let barWidth = 100;
-        if (mouseX >= sliderStartX && mouseX <= sliderStartX + barWidth) {
-           let newVolume = map(mouseX, sliderStartX, sliderStartX + barWidth, 0, 100, true);
-           if (selectedOption === 0) masterVolume = newVolume;
-           else if (selectedOption === 1) musicVolume = newVolume;
-           else if (selectedOption === 2) sfxVolume = newVolume;
-        }
-    } else if ((gameState === 'Playing' || gameState === 'Setup') && isDragging) {
-        let dx = mouseX - prevMouseX; let dy = mouseY - prevMouseY;
-        let worldWidthAtZoom = BASE_WORLD_WIDTH * zoom; let worldHeightAtZoom = BASE_WORLD_HEIGHT * zoom;
-        let degPerPixelX = 360 / worldWidthAtZoom; let degPerPixelY = -180 / worldHeightAtZoom;
-        centerLon -= dx * degPerPixelX; centerLat -= dy * degPerPixelY;
-        centerLon = ((centerLon + 180 + 360) % 360) - 180; centerLat = constrain(centerLat, -85, 85);
-        prevMouseX = mouseX; prevMouseY = mouseY;
+    if (mouseX === initialMouseX && mouseY === initialMouseY) {
+        // If the mouse hasn't moved significantly, don't start dragging yet
+        // This helps distinguish clicks from small drags
+        return; 
     }
+    isDragging = true; // Set drag flag if mouse moved significantly
+
+    if (gameState === 'Playing' || gameState === 'Setup' || gameState === 'MainMenu' || gameState === 'Options') {
+        let dx = mouseX - prevMouseX;
+        let dy = mouseY - prevMouseY;
+        let worldDx = dx / zoom;
+        let worldDy = dy / zoom;
+        let lonPerPixel = 360 / (BASE_WORLD_WIDTH); // Approximate degrees per world pixel
+        let latPerPixel = 180 / (BASE_WORLD_HEIGHT); // Approximate degrees per world pixel
+        centerLon -= worldDx * lonPerPixel;
+        centerLat += worldDy * latPerPixel; // Latitude increases upwards in screen coords, downwards in world coords
+        centerLon = constrain(centerLon, -180, 180);
+        centerLat = constrain(centerLat, -90, 90);
+    } else if (gameState === 'Options') {
+         handleVolumeClick(); // Allow dragging on volume sliders
+    }
+    prevMouseX = mouseX;
+    prevMouseY = mouseY;
 }
 
 function mouseReleased() {
-    if (mouseButton === LEFT) {
-        const dragThreshold = 5;
-        let distanceMoved = (initialMouseX !== -1 && initialMouseY !== -1) ? dist(mouseX, mouseY, initialMouseX, initialMouseY) : dragThreshold + 1;
-
-        if (gameState === 'Playing') {
-            if (distanceMoved < dragThreshold) {
-                 // console.log(`mouseReleased: Click detected. Distance: ${distanceMoved.toFixed(1)}. Calling handleGameClick.`); 
-                 handleGameClick();
-            } else if (isDragging) {
-                 // console.log(`mouseReleased: Drag detected. Distance: ${distanceMoved.toFixed(1)}. Not calling handleGameClick.`); 
-            }
-        }
-        isDragging = false;
-        initialMouseX = -1;
-        initialMouseY = -1;
+    if (!isDragging) {
+        // This was a click, not a drag.
+        // The actual click logic is handled in mousePressed.
+        // We might add logic here if needed for actions *after* a click is confirmed.
     }
+    isDragging = false; // Reset drag flag
+    initialMouseX = -1; // Reset initial click position
+    initialMouseY = -1;
 }
 
 function mouseWheel(event) {
-    if (gameState === 'Playing' || gameState === 'Setup') {
-        let scaleFactor = 1.1; let zoomDelta = (event.delta < 0) ? scaleFactor : 1 / scaleFactor;
-        let mouseWorldBefore = screenToWorld(mouseX, mouseY); zoom *= zoomDelta; zoom = constrain(zoom, minZoom, maxZoom);
+    if (gameState === 'Playing' || gameState === 'Setup' || gameState === 'MainMenu' || gameState === 'Options') {
+        let factor = pow(1.001, -event.delta);
+        let newZoom = zoom * factor;
+        newZoom = constrain(newZoom, minZoom, maxZoom);
+
+        // Zoom towards the mouse cursor
+        let mouseWorldBefore = screenToWorld(mouseX, mouseY);
+        zoom = newZoom;
         let mouseWorldAfter = screenToWorld(mouseX, mouseY);
-        centerLon += mouseWorldBefore.lon - mouseWorldAfter.lon; centerLat += mouseWorldBefore.lat - mouseWorldAfter.lat;
-        centerLon = ((centerLon + 180 + 360) % 360) - 180; centerLat = constrain(centerLat, -85, 85);
-        return false;
+
+        centerLon += mouseWorldBefore.lon - mouseWorldAfter.lon;
+        centerLat += mouseWorldBefore.lat - mouseWorldAfter.lat;
+        centerLon = constrain(centerLon, -180, 180);
+        centerLat = constrain(centerLat, -90, 90);
+
+        return false; // Prevent default browser scroll
     }
-    return true;
 }
 
 function windowResized() {
