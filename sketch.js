@@ -13,6 +13,28 @@ let masterVolume = 75;
 let musicVolume = 60;
 let sfxVolume = 80;
 
+// Music Variables
+let musicTracks = []; // Array to hold loaded p5.SoundFile objects
+let currentTrackIndex = -1; // Index of the currently playing track
+let musicFilenames = [ // *** LIST YOUR MUSIC FILES HERE ***
+    'MUSIC/Al_Basrah.mp3',
+    'MUSIC/Cairo_Egypt.mp3',
+    'MUSIC/Finland.mp3',
+    'MUSIC/Greece.mp3',
+    'MUSIC/Helsinki_Sweden.mp3',
+    'MUSIC/Jerusalem_Israel.mp3',
+    'MUSIC/Munich_Germany.mp3',
+    'MUSIC/Nakhayb_Iraq.mp3',
+    'MUSIC/Naples_Italy.mp3',
+    'MUSIC/Norway_Nephelim_Battle.mp3',
+    'MUSIC/Rome_Italy.mp3',
+    'MUSIC/Splash_Screen_Opus.mp3',
+    'MUSIC/Turin_Italy.mp3',
+    'MUSIC/Vienna_Austria.mp3',
+    'MUSIC/Zurich_Switzerland.mp3'
+];
+let musicIsPlaying = false; // Flag to track if music is intended to play
+
 // Map Interaction State
 let zoom = 1;
 let minZoom = 0.8;
@@ -96,6 +118,20 @@ const BASE_WORLD_HEIGHT = BASE_WORLD_WIDTH / 2;
 function preload() {
     worldGeoJSON = loadJSON('countries.geojson');
     citiesGeoJSON = loadJSON('cities.geojson');
+
+    // *** LOAD MUSIC TRACKS ***
+    console.log("Loading music...");
+    for (let filename of musicFilenames) {
+        try {
+            let track = loadSound(filename,
+              () => console.log(`Successfully loaded: ${filename}`), // Success callback
+              (err) => console.error(`Error loading sound: ${filename}`, err) // Error callback
+            );
+            musicTracks.push(track);
+        } catch (error) {
+             console.error(`Exception loading sound file ${filename}:`, error);
+        }
+    }
 }
 
 function setup() {
@@ -103,6 +139,8 @@ function setup() {
     textFont('monospace');
     console.log("World data loaded");
     console.log("Cities data loaded");
+
+    // Music will start after user interaction (e.g., clicking Start Simulation)
 }
 
 function draw() {
@@ -317,6 +355,79 @@ function drawGameUIOverlay() {
         if (city) text(`Target: ${city.name}. CLICK AGAIN TO LAUNCH.`, width / 2, height - 55);
     }
     pop();
+}
+
+
+// --- Music Playback Functions ---
+
+function startMusic() {
+    if (musicTracks.length === 0) {
+        console.log("No music tracks loaded or available.");
+        return;
+    }
+    if (!musicIsPlaying) {
+        console.log("Starting music playback...");
+        musicIsPlaying = true;
+        // Start with a random track
+        currentTrackIndex = floor(random(musicTracks.length));
+        console.log(`Starting music with random track index: ${currentTrackIndex}`);
+        playNextTrack(); // Start the sequence
+    } else {
+        // If music is already intended to be playing, ensure the current track is playing (e.g., after pausing)
+        if (currentTrackIndex !== -1 && musicTracks[currentTrackIndex] && !musicTracks[currentTrackIndex].isPlaying()) {
+            musicTracks[currentTrackIndex].play();
+             applyMusicVolume(); // Apply volume when resuming
+             console.log("Resuming music track:", musicFilenames[currentTrackIndex]);
+        }
+    }
+}
+
+function stopMusic() {
+    if (musicIsPlaying && currentTrackIndex !== -1 && musicTracks[currentTrackIndex]) {
+        console.log("Stopping music playback.");
+        musicTracks[currentTrackIndex].stop();
+    }
+    musicIsPlaying = false;
+    // currentTrackIndex = -1; // Keep index to potentially resume later? Or reset? Resetting is simpler.
+    currentTrackIndex = -1;
+}
+
+function playNextTrack() {
+    if (!musicIsPlaying || musicTracks.length === 0) return; // Don't proceed if music shouldn't be playing
+
+    // Stop the previous track if it's somehow still playing (shouldn't be necessary with onended, but safe)
+    if (currentTrackIndex !== -1 && musicTracks[currentTrackIndex] && musicTracks[currentTrackIndex].isPlaying()) {
+        musicTracks[currentTrackIndex].stop();
+    }
+
+    // Increment index and loop around
+    currentTrackIndex = (currentTrackIndex + 1) % musicTracks.length;
+
+    let trackToPlay = musicTracks[currentTrackIndex];
+
+    if (trackToPlay && trackToPlay.isLoaded()) {
+        console.log("Playing next track:", musicFilenames[currentTrackIndex]);
+        applyMusicVolume(); // Set volume before playing
+        trackToPlay.play();
+        // Set the callback for when this track finishes
+        trackToPlay.onended(playNextTrack); // Automatically plays the next one when this ends
+    } else {
+         console.warn(`Track ${currentTrackIndex} (${musicFilenames[currentTrackIndex]}) not loaded or invalid, skipping.`);
+         // Immediately try the next track to avoid silence
+         // Use setTimeout to avoid potential infinite loop if all tracks fail
+         setTimeout(playNextTrack, 100);
+    }
+}
+
+function applyMusicVolume() {
+    if (currentTrackIndex !== -1 && musicTracks[currentTrackIndex] && musicTracks[currentTrackIndex].isLoaded()) {
+        // Calculate combined volume (0.0 to 1.0 range)
+        let combinedVolume = (musicVolume / 100) * (masterVolume / 100);
+        // Clamp volume between 0 and 1
+        combinedVolume = constrain(combinedVolume, 0, 1);
+        musicTracks[currentTrackIndex].setVolume(combinedVolume);
+        console.log(`Applying volume: ${combinedVolume.toFixed(3)} (Music: ${musicVolume.toFixed(0)}%, Master: ${masterVolume.toFixed(0)}%) to track ${currentTrackIndex}`); // DEBUG log
+    }
 }
 
 // --- Game Logic & Setup Functions ---
@@ -769,6 +880,12 @@ function findClickedCity(lon, lat) {
 // --- Input Handling ---
 
 function mousePressed() {
+    // Resume AudioContext if it was suspended due to browser policy
+    if (getAudioContext().state !== 'running') {
+        userStartAudio();
+        console.log("AudioContext resumed on user gesture.");
+    }
+
     initialMouseX = mouseX; initialMouseY = mouseY;
     prevMouseX = mouseX; // Initialize prevMouse for drag calculation
     prevMouseY = mouseY; // Initialize prevMouse for drag calculation
@@ -804,6 +921,7 @@ function handleMainMenuClick() {
     if (selectedOption === 0) { // START
         gameState = 'Setup';
         initializeGameSetup("NorthAmerica"); // Default to North America for now
+        startMusic(); // Start music when entering setup/game
     } else if (selectedOption === 1) { // OPTIONS
         gameState = 'Options';
     } else if (selectedOption === 2) { // EXIT
