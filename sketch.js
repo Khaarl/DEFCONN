@@ -122,6 +122,7 @@ const POP_TIER3_THRESHOLD = 10000000;
 const LABEL_ZOOM_THRESHOLD = 4.0;
 const BASE_WORLD_WIDTH = 2048;
 const BASE_WORLD_HEIGHT = BASE_WORLD_WIDTH / 2;
+const KEY_PAN_SPEED = 15; // Screen pixels per frame for key panning
 
 // --- P5.js Core Functions ---
 
@@ -153,7 +154,41 @@ function setup() {
     // Music will start after user interaction (e.g., clicking Start Simulation)
 }
 
+// --- Keyboard Panning ---
+function handleKeyboardPanning() {
+    // Only allow panning in states where the map is the primary focus
+    if (gameState === 'Playing' || gameState === 'Setup' || gameState === 'MainMenu' || gameState === 'Options') {
+        let panAmount = KEY_PAN_SPEED / zoom; // Pan faster when zoomed out, slower when zoomed in
+        let lonPerPixel = 360 / BASE_WORLD_WIDTH;
+        let latPerPixel = 180 / BASE_WORLD_HEIGHT;
+
+        let dLon = 0;
+        let dLat = 0;
+
+        if (keyIsDown(87)) { // W key
+            dLat += panAmount * latPerPixel;
+        }
+        if (keyIsDown(83)) { // S key
+            dLat -= panAmount * latPerPixel;
+        }
+        if (keyIsDown(65)) { // A key
+            dLon -= panAmount * lonPerPixel;
+        }
+        if (keyIsDown(68)) { // D key
+            dLon += panAmount * lonPerPixel;
+        }
+
+        if (dLon !== 0 || dLat !== 0) {
+            centerLon += dLon;
+            centerLat += dLat;
+            centerLon = constrain(centerLon, -180, 180);
+            centerLat = constrain(centerLat, -90, 90);
+        }
+    }
+}
+
 function draw() {
+    handleKeyboardPanning(); // Check for WASD panning input first
     background(DEFCON_BG_COLOR[0], DEFCON_BG_COLOR[1], DEFCON_BG_COLOR[2]);
 
     if (gameState === 'MainMenu') {
