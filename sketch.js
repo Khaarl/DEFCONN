@@ -67,6 +67,7 @@ let territories = {
     }
 };
 let playerTerritory = null; // Key of the player's territory
+let aiTerritories = ["Eurasia"]; // List of territory keys controlled by AI
 let gameUnits = []; // Holds all placed units { type, owner, lon, lat, id, ammo?, state?, range? }
 let selectedUnitForFiring = null; // ID of the silo selected for firing
 let gameCities = []; // Simplified list for quick lookup: { name, lon, lat, population, initialPopulation, ownerTerritory, destroyed: false, id, state? }
@@ -75,11 +76,20 @@ let selectedCityForTargeting = null; // ID of city selected for targeting
 
 // Missile & Effects Data
 let activeMissiles = []; // { id, owner, startX, startY, targetX, targetY, currentX, currentY, type, detected }
+let activeABMs = []; // { id, owner, siloId, startX, startY, targetMissileId, currentX, currentY }
 let activeExplosions = []; // { x, y, radius, maxRadius, duration, age, owner }
+let activeIntercepts = []; // Store visual effect for successful intercepts
+
 const MISSILE_WORLD_SPEED_DEG_PER_SEC = 5.0;
 const CITY_IMPACT_RADIUS_DEG = 1.0;
 const UNIT_IMPACT_RADIUS_DEG = 0.5;
 const MEGADEATHS_PER_NUKE = 2.5;
+
+// --- Constants for ABM ---
+const ABM_LAUNCH_RANGE_DEG = 15; // How close an enemy missile needs to be to a defensive silo (degrees)
+const ABM_SPEED_DEG_PER_SEC = 10.0; // ABMs should be faster than ICBMs
+const ABM_INTERCEPT_CHANCE = 0.75; // 75% chance to destroy target on hit
+const ABM_INTERCEPT_RADIUS_DEG = 0.3; // How close ABM needs to get to target missile
 
 // Game Progression Variables
 let currentDefconLevel = 5;
@@ -306,12 +316,17 @@ function drawSetupScreen() {
 
 function drawGameScreen() {
     updateGameTimeAndDefcon();
-    updateDetection(); // <<< CALL DETECTION LOGIC HERE
-    updateMissiles();
+    updateAI(); // <<< CALL AI LOGIC HERE
+    updateDetection();
+    updateDefenseActions(); // <<< CALL DEFENSE LOGIC
+    updateMissiles(); // Updates ICBMs
+    updateABMs(); // <<< UPDATE ABM POSITIONS (Need to create this function)
     drawBackgroundMapAndCities();
     gameUnits.forEach(unit => { drawUnit(unit); });
-    drawMissiles(); // Will be modified next
-    drawExplosions();
+    drawMissiles();
+    drawABMs(); // <<< DRAW ABMS (Need to create this function)
+    drawExplosions(); // Includes ICBM impacts
+    drawInterceptExplosions(); // <<< DRAW ABM INTERCEPTS (Need to create this function)
     drawGameUIOverlay();
 }
 
@@ -432,8 +447,10 @@ function applyMusicVolume() {
 
 // --- Game Logic & Setup Functions ---
 
-function initializeGameSetup(territoryKey) {
-    playerTerritory = territoryKey; gameUnits = []; currentDefconLevel = 5;
+function initializeGameSetup(playerTerritoryKey) {
+    playerTerritory = playerTerritoryKey;
+    gameUnits = []; // Clear units for all players
+    currentDefconLevel = 5;
     elapsedGameTime = 0; gameStartTime = 0; setupConfirmed = false; currentPlacementIndex = 0;
     gameCities = []; activeMissiles = []; activeExplosions = [];
     
@@ -482,29 +499,149 @@ function initializeGameSetup(territoryKey) {
         console.log(`Added ${gameCities.length} cities to gameCities (pop >= ${POP_TIER1_THRESHOLD}). ${processedCount} assigned to specific territories. ${unownedCount} initially unassigned from main territories (now Neutral).`);
     }
 
-    // Define initial assets with radar properties
-    let initialAssets = [
-        { type: 'Silo', count: 3 },
-        // *** ADD RADAR DETAILS HERE ***
-        { type: 'Radar', count: 2, range: 25, state: 'active' } // Example range in degrees, initial state active
+    // --- Initialize Player Assets ---
+    // (Only need to define assets for the human player to place)
+    let playerAssetsConfig = [
+        { type: 'Silo', count: 3, ammo: 10, mode: 'OFFENSIVE', state: 'idle' }, // <<< Add default mode
+        { type: 'Radar', count: 2, range: 25, state: 'active' }
     ];
-    assetsToPlace = [];
-    initialAssets.forEach(assetGroup => {
-        for(let i = 0; i < assetGroup.count; i++) {
+    assetsToPlace = []; // Reset player's placement list
+    playerAssetsConfig.forEach(assetGroup => {
+        for (let i = 0; i < assetGroup.count; i++) {
             let unitData = { type: assetGroup.type };
             if (assetGroup.type === 'Silo') {
-                unitData.ammo = 10; unitData.state = 'idle';
+                 unitData.ammo = assetGroup.ammo || 10;
+                 unitData.state = assetGroup.state || 'idle';
+                 unitData.mode = assetGroup.mode || 'OFFENSIVE'; // <<< Add mode
             }
-            // *** COPY RADAR DETAILS ***
-            else if (assetGroup.type === 'Radar') {
-                unitData.range = assetGroup.range || 20; // Default range if not specified
-                unitData.state = assetGroup.state || 'active'; // Default state
-            }
+            else if (assetGroup.type === 'Radar') { unitData.range = assetGroup.range || 20; unitData.state = assetGroup.state || 'active'; }
             assetsToPlace.push(unitData);
         }
     });
+
+    // --- Initialize AI Assets Automatically ---
+    console.log("Placing AI units...");
+    for (const aiTerritoryKey of aiTerritories) {
+        placeAIUnits(aiTerritoryKey); // Call the new function to place AI units
+    }
+
+    // --- Reset view for player ---
     zoom = 1.5; centerLon = territories[playerTerritory].center.lon; centerLat = territories[playerTerritory].center.lat;
-    console.log(`Initializing setup for ${territories[playerTerritory].name}. Place ${assetsToPlace.length} assets.`);
+    console.log(`Initializing setup for Player: ${territories[playerTerritory].name}. Place ${assetsToPlace.length} assets.`);
+}
+
+
+// --- Add this new function ---
+function placeAIUnits(aiTerritoryKey) {
+    if (!territories[aiTerritoryKey]) return;
+
+    // Define the assets the AI gets (can be same or different from player)
+    let aiAssetsConfig = [
+        { type: 'Silo', count: 3, ammo: 10, mode: 'OFFENSIVE', state: 'idle' },
+        { type: 'Radar', count: 2, range: 25, state: 'active' }
+    ];
+
+    let bounds = territories[aiTerritoryKey].placementArea;
+    let placedCount = 0;
+
+    aiAssetsConfig.forEach(assetGroup => {
+        for (let i = 0; i < assetGroup.count; i++) {
+            // Find a random valid location within bounds (simple random placement)
+            // Could add checks later to avoid placing units too close together
+            let lon = random(bounds.minLon, bounds.maxLon);
+            let lat = random(bounds.minLat, bounds.maxLat);
+
+            let newUnit = {
+                type: assetGroup.type,
+                owner: aiTerritoryKey,
+                lon: lon,
+                lat: lat,
+                id: `unit_${aiTerritoryKey}_${Date.now()}_${random(1000)}`,
+                ammo: assetGroup.ammo, // Copy specific properties
+                state: assetGroup.state,
+                range: assetGroup.range
+            };
+             // Ensure default state if somehow missed
+             if (!newUnit.state) {
+                 newUnit.state = (newUnit.type === 'Radar' ? 'active' : 'idle');
+             }
+
+            gameUnits.push(newUnit);
+            placedCount++;
+        }
+    });
+    console.log(`Placed ${placedCount} units for AI territory: ${aiTerritoryKey}`);
+}
+
+let aiActionTimers = {}; // Track time since last action for each AI territory
+
+function updateAI() {
+    if (gameState !== 'Playing') return;
+
+    let currentTime = millis();
+
+    for (const aiTerritoryKey of aiTerritories) {
+        // Initialize timer if not present
+        if (!aiActionTimers[aiTerritoryKey]) {
+             aiActionTimers[aiTerritoryKey] = { lastFireCheck: currentTime, fireCooldown: 15000 + random(10000) }; // Cooldown in ms (15-25s)
+        }
+
+        // --- AI Firing Logic ---
+        // Check if enough time has passed since last check and if DEFCON allows firing
+        // (AI might cheat or follow rules - let's make it follow rules for now)
+        // TEMP: Allow firing at DEFCON 5 for testing
+        if (currentDefconLevel <= 5 && currentTime - aiActionTimers[aiTerritoryKey].lastFireCheck > aiActionTimers[aiTerritoryKey].fireCooldown) {
+            aiActionTimers[aiTerritoryKey].lastFireCheck = currentTime; // Reset timer
+            aiActionTimers[aiTerritoryKey].fireCooldown = 15000 + random(10000); // Set next cooldown
+
+             console.log(`AI Check: ${aiTerritoryKey} considering firing...`); // DEBUG
+
+            // 1. Find an available AI silo with ammo
+            let availableSilos = gameUnits.filter(u =>
+                u.owner === aiTerritoryKey &&
+                u.type === 'Silo' &&
+                u.state === 'idle' && // Could be refined later
+                u.ammo > 0
+            );
+
+            if (availableSilos.length > 0) {
+                let firingSilo = random(availableSilos); // Pick a random available silo
+
+                // 2. Find a target (e.g., a random non-destroyed enemy city)
+                let potentialTargets = gameCities.filter(c =>
+                    !c.destroyed &&
+                    c.ownerTerritory !== aiTerritoryKey && // Not own or Neutral (target player/other AIs)
+                    c.ownerTerritory !== "Neutral" // Or maybe target Neutral? Choose based on desired difficulty
+                );
+
+                if (potentialTargets.length > 0) {
+                    let targetCity = random(potentialTargets); // Pick a random valid target city
+
+                    console.log(`AI ACTION: ${aiTerritoryKey} launching from Silo ${firingSilo.id} at City ${targetCity.name} (${targetCity.ownerTerritory})`);
+
+                    // 3. Launch Missile
+                    firingSilo.ammo--;
+                    activeMissiles.push({
+                        id: `missile_${aiTerritoryKey}_${Date.now()}_${random(1000)}`,
+                        owner: aiTerritoryKey,
+                        startX: firingSilo.lon, startY: firingSilo.lat,
+                        targetX: targetCity.lon, targetY: targetCity.lat,
+                        currentX: firingSilo.lon, currentY: firingSilo.lat,
+                        type: 'ICBM',
+                        detected: false // AI missiles also start undetected
+                    });
+                    // Maybe set silo state to 'reloading' for a period later
+                } else {
+                     console.log(`AI Check: ${aiTerritoryKey} found silo but no valid city targets.`); // DEBUG
+                }
+            } else {
+                console.log(`AI Check: ${aiTerritoryKey} has no available silos to fire.`); // DEBUG
+            }
+        }
+
+        // TODO: Add AI logic for other units (moving fleets, launching bombers) later
+        // TODO: Add AI radar detection logic (AI detecting player missiles)
+    }
 }
 
 function updateGameTimeAndDefcon() {
@@ -550,6 +687,87 @@ function updateDetection() {
                         console.log(`Radar ${radar.id} detected enemy missile ${missile.id}`);
                     }
                 }
+            
+                // --- AI Detection of Player Missiles ---
+                for (const aiTerritoryKey of aiTerritories) {
+                    for (let radar of gameUnits) {
+                        // Check if it's an active AI radar owned by this specific AI
+                        if (radar.type === 'Radar' && radar.owner === aiTerritoryKey && radar.state === 'active') {
+                            for (let missile of activeMissiles) {
+                                // Detect player missiles (owner is playerTerritory)
+                                // We might need a separate flag like `detectedByAI` later if AI needs private detection info
+                                if (missile.owner === playerTerritory && !missile.detected) { // For now, use same 'detected' flag
+                                    let dLon = radar.lon - missile.currentX;
+                                    let dLat = radar.lat - missile.currentY;
+                                    let distSq = dLon*dLon + dLat*dLat;
+                                    let rangeSq = radar.range * radar.range;
+                                    if (distSq < rangeSq) {
+                                        // missile.detected = true; // Does player need to know AI detected it? Maybe not.
+                                        // Instead, log or trigger AI reaction later.
+                                        console.log(`AI Radar ${radar.id} (${aiTerritoryKey}) detected player missile ${missile.id}`);
+                                        // Set a flag for AI reaction?
+                                        // missile.detectedByAI = true; // Add this property if needed
+                                        // Or trigger an immediate AI response check?
+                                    }
+                                }
+                            
+                                // --- AI Detection of Player Missiles ---
+                                for (const aiTerritoryKey of aiTerritories) {
+                                    for (let radar of gameUnits) {
+                                        // Check if it's an active AI radar owned by this specific AI
+                                        if (radar.type === 'Radar' && radar.owner === aiTerritoryKey && radar.state === 'active') {
+                                            for (let missile of activeMissiles) {
+                                                // Detect player missiles (owner is playerTerritory)
+                                                // We might need a separate flag like `detectedByAI` later if AI needs private detection info
+                                                if (missile.owner === playerTerritory && !missile.detected) { // For now, use same 'detected' flag
+                                                    let dLon = radar.lon - missile.currentX;
+                                                    let dLat = radar.lat - missile.currentY;
+                                                    let distSq = dLon*dLon + dLat*dLat;
+                                                    let rangeSq = radar.range * radar.range;
+                                                    if (distSq < rangeSq) {
+                                                        // missile.detected = true; // Does player need to know AI detected it? Maybe not.
+                                                        // Instead, log or trigger AI reaction later.
+                                                        console.log(`AI Radar ${radar.id} (${aiTerritoryKey}) detected player missile ${missile.id}`);
+                                                        // Set a flag for AI reaction?
+                                                        // missile.detectedByAI = true; // Add this property if needed
+                                                        // Or trigger an immediate AI response check?
+                                                    }
+                                                }
+                                            
+                                                // --- AI Detection of Player Missiles ---
+                                                for (const aiTerritoryKey of aiTerritories) {
+                                                    for (let radar of gameUnits) {
+                                                        // Check if it's an active AI radar owned by this specific AI
+                                                        if (radar.type === 'Radar' && radar.owner === aiTerritoryKey && radar.state === 'active') {
+                                                            for (let missile of activeMissiles) {
+                                                                // Detect player missiles (owner is playerTerritory)
+                                                                // We might need a separate flag like `detectedByAI` later if AI needs private detection info
+                                                                if (missile.owner === playerTerritory && !missile.detected) { // For now, use same 'detected' flag
+                                                                    let dLon = radar.lon - missile.currentX;
+                                                                    let dLat = radar.lat - missile.currentY;
+                                                                    let distSq = dLon*dLon + dLat*dLat;
+                                                                    let rangeSq = radar.range * radar.range;
+                                                                    if (distSq < rangeSq) {
+                                                                        // missile.detected = true; // Does player need to know AI detected it? Maybe not.
+                                                                        // Instead, log or trigger AI reaction later.
+                                                                        console.log(`AI Radar ${radar.id} (${aiTerritoryKey}) detected player missile ${missile.id}`);
+                                                                        // Set a flag for AI reaction?
+                                                                        // missile.detectedByAI = true; // Add this property if needed
+                                                                        // Or trigger an immediate AI response check?
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             // TODO: Add detection logic for other enemy units (bombers, subs) when they are implemented
         }
@@ -561,6 +779,66 @@ function updateDetection() {
     // Set missile.detected = true (or missile.detectedByAI = true)
 }
 
+// Helper function to check if a missile is already targeted by an active ABM
+function isActiveABMTarget(missileId) {
+    for (let abm of activeABMs) {
+        if (abm.targetMissileId === missileId) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function updateDefenseActions() {
+    if (gameState !== 'Playing') return;
+
+     // --- ABM Launching ---
+     // Check each DETECTED enemy missile
+     for (let missile of activeMissiles) {
+         // Only consider detected enemy missiles that are not already targeted by an ABM
+         if (missile.owner !== playerTerritory && missile.detected && !isActiveABMTarget(missile.id)) {
+
+             // Find the *closest* available player defensive silo within range
+             let bestSilo = null;
+             let minDistSq = ABM_LAUNCH_RANGE_DEG * ABM_LAUNCH_RANGE_DEG;
+
+             for (let silo of gameUnits) {
+                  // Check if it's player's, defensive, has ammo, and is idle
+                 if (silo.owner === playerTerritory &&
+                     silo.type === 'Silo' &&
+                     silo.mode === 'DEFENSIVE' &&
+                     silo.ammo > 0 &&
+                     silo.state === 'idle') { // Use state later for cooldown?
+
+                     let dLon = silo.lon - missile.currentX;
+                     let dLat = silo.lat - missile.currentY;
+                     let distSq = dLon*dLon + dLat*dLat;
+
+                     if (distSq < minDistSq) {
+                         minDistSq = distSq;
+                         bestSilo = silo;
+                     }
+                 }
+             }
+
+             // If a suitable silo was found, launch an ABM
+             if (bestSilo) {
+                 console.log(`DEFENSE: Silo ${bestSilo.id} launching ABM at Missile ${missile.id}`);
+                 bestSilo.ammo--; // Use shared ammo pool
+                 // bestSilo.state = 'reloading'; // Set state for cooldown later
+                 activeABMs.push({
+                     id: `abm_${Date.now()}_${random(1000)}`,
+                     owner: playerTerritory,
+                     siloId: bestSilo.id,
+                     startX: bestSilo.lon, startY: bestSilo.lat,
+                     targetMissileId: missile.id, // Track which missile it's going after
+                     currentX: bestSilo.lon, currentY: bestSilo.lat
+                 });
+             }
+         }
+     }
+      // TODO: AI ABM Launch Logic
+}
 
 function updateMissiles() {
     if (activeMissiles.length === 0) return;
@@ -707,9 +985,43 @@ function drawUnit(unit, isSetupPhase = false) {
 
     // --- Draw Base Unit Icons ---
     if (unit.type === 'Silo') {
-        fill(unitColor); stroke(strokeColor); strokeWeight(max(0.5, 1 / zoom)); let size = 8 + zoom * 0.5; size = max(4, size);
+        let currentUnitColor = [...unitColor];
+        let currentStrokeColor = [...strokeColor];
+        if (!isSetupPhase && unit.mode === 'DEFENSIVE') {
+            currentStrokeColor = [0, 150, 255];
+            currentUnitColor = [unitColor[0]*0.7, unitColor[1]*0.7, unitColor[2]*0.7, unitColor[3]];
+        }
+
+        fill(currentUnitColor); stroke(currentStrokeColor); strokeWeight(max(0.5, 1 / zoom)); let size = 8 + zoom * 0.5; size = max(4, size);
         triangle(screenPos.x, screenPos.y - size*0.6, screenPos.x - size*0.4, screenPos.y + size*0.4, screenPos.x + size*0.4, screenPos.y + size*0.4);
-        if (unit.ammo > 0 && zoom > 1.5 && !isSetupPhase) { fill(255); textSize(max(6, 8 + zoom*0.2)); textAlign(CENTER, TOP); noStroke(); text(unit.ammo, screenPos.x, screenPos.y + size*0.5); }
+        
+        noStroke();
+        let ammoTextSize = max(9, 14 / zoom); // Further Increased ammo text size
+        let modeTextSize = max(10, 18 / zoom); // Further Increased mode text size
+        
+        let textYPosition = screenPos.y + size * 0.6; // Start Y position below the silo tip, adjusted for TOP alignment
+
+        if (unit.ammo > 0 && zoom > 0.8 && !isSetupPhase) { // Show ammo even earlier and larger
+            fill(255);
+            textSize(ammoTextSize);
+            textAlign(CENTER, TOP);
+            text(unit.ammo, screenPos.x, textYPosition);
+            textYPosition += ammoTextSize + (4 / zoom); // Increased spacing for the mode text
+        }
+        
+        // Display Silo Mode for player units
+        if (unit.owner === playerTerritory && zoom > 0.5 && !isSetupPhase) {
+            fill(220, 220, 220, 250); // Brighter alpha
+            textSize(modeTextSize);
+            textAlign(CENTER, TOP);
+            let modeText = unit.mode === 'OFFENSIVE' ? "OFF" : "DEF";
+            // If ammo wasn't shown, adjust Y to be closer to silo base
+            if (!(unit.ammo > 0 && zoom > 0.8 && !isSetupPhase)){
+                 textYPosition = screenPos.y + size * 0.6 + modeTextSize * 0.5; // Center it more if no ammo
+            }
+            text(modeText, screenPos.x, textYPosition);
+        }
+
     } else if (unit.type === 'Radar') {
         let size = 10 + zoom * 0.5; size = max(5, size);
         if(unit.state === 'destroyed') {
@@ -1117,7 +1429,142 @@ function mouseWheel(event) {
         return false; // Prevent default browser scroll
     }
 }
+function keyPressed() {
+    if (keyCode === 32) { // 32 is the keyCode for SPACE
+        // Allow mode switching in Setup or Playing phase, or any phase where units might be visible
+        if (gameState === 'Playing' || gameState === 'Setup' || gameState === 'MainMenu' || gameState === 'Options') {
+            let hoveredSilo = null;
+            const clickRadius = 15; // Screen pixels - fixed size for easier hover regardless of zoom
+
+            // Iterate in reverse so top-most unit is selected if overlapping
+            for (let i = gameUnits.length - 1; i >= 0; i--) {
+                const unit = gameUnits[i];
+                if (unit.owner === playerTerritory && unit.type === 'Silo') {
+                    let unitScreenPos = worldToScreen(unit.lon, unit.lat);
+                    if (dist(mouseX, mouseY, unitScreenPos.x, unitScreenPos.y) < clickRadius) {
+                        hoveredSilo = unit;
+                        break;
+                    }
+                }
+            }
+            
+            if (hoveredSilo) {
+                if (hoveredSilo.mode === 'OFFENSIVE') {
+                    hoveredSilo.mode = 'DEFENSIVE';
+                    console.log(`Silo ${hoveredSilo.id} mode set to DEFENSIVE via SPACE key.`);
+                } else {
+                    hoveredSilo.mode = 'OFFENSIVE';
+                    console.log(`Silo ${hoveredSilo.id} mode set to OFFENSIVE via SPACE key.`);
+                }
+                // Deselect if it was selected for firing
+                if (selectedUnitForFiring === hoveredSilo.id) {
+                    selectedUnitForFiring = null;
+                    hoveredSilo.state = 'idle'; // Reset selection state
+                    console.log("Firing selection cancelled due to mode change.");
+                }
+            }
+        }
+    }
+}
 
 function windowResized() {
     resizeCanvas(windowWidth, windowHeight);
+}
+// --- Create ABM Update Function ---
+function updateABMs() {
+    if (activeABMs.length === 0) return;
+    let speedThisFrame = ABM_SPEED_DEG_PER_SEC * (deltaTime / 1000);
+
+    for (let i = activeABMs.length - 1; i >= 0; i--) {
+        let abm = activeABMs[i];
+
+        // Find the target missile (it might have been destroyed already)
+        let targetMissile = activeMissiles.find(m => m.id === abm.targetMissileId);
+
+        if (!targetMissile) {
+            // Target gone, remove ABM
+            console.log(`ABM ${abm.id} target lost.`);
+            activeABMs.splice(i, 1);
+            continue;
+        }
+
+        // Calculate direction towards target missile's *current* position
+        let targetVector = createVector(targetMissile.currentX - abm.currentX, targetMissile.currentY - abm.currentY);
+        let distanceToTarget = targetVector.mag();
+
+        // --- Interception Check ---
+        if (distanceToTarget < ABM_INTERCEPT_RADIUS_DEG) {
+            console.log(`ABM ${abm.id} attempting intercept on Missile ${targetMissile.id}`);
+            if (random() < ABM_INTERCEPT_CHANCE) { // Roll for success
+                console.log(`   >>> SUCCESS! Missile ${targetMissile.id} intercepted!`);
+                // Remove the target missile
+                let targetIndex = activeMissiles.findIndex(m => m.id === targetMissile.id);
+                if (targetIndex !== -1) activeMissiles.splice(targetIndex, 1);
+                // Add intercept visual effect
+                activeIntercepts.push({ x: abm.currentX, y: abm.currentY, age: 0, duration: 30 });
+            } else {
+                console.log(`   >>> FAILED intercept!`);
+                // ABM missed, just remove ABM
+            }
+            activeABMs.splice(i, 1); // Remove ABM after attempt
+            continue;
+        }
+
+        // --- Move ABM ---
+        targetVector.normalize();
+        targetVector.mult(speedThisFrame);
+        abm.currentX += targetVector.x;
+        abm.currentY += targetVector.y;
+        abm.currentX = constrain(abm.currentX, -180, 180);
+        abm.currentY = constrain(abm.currentY, -90, 90);
+
+        // Optional: Remove ABM if it flies too far past target?
+    }
+}
+
+// --- Create ABM Drawing Function ---
+function drawABMs() {
+    push();
+    strokeWeight(max(0.5, 1 / zoom)); // Thinner trail for ABMs?
+
+    for (let abm of activeABMs) {
+        let startScreen = worldToScreen(abm.startX, abm.startY);
+        let currentScreen = worldToScreen(abm.currentX, abm.currentY);
+
+        // Trail color (e.g., player's color but brighter/different?)
+        let trailColor = territories[abm.owner] ? territories[abm.owner].color : [200,200,200];
+        stroke(trailColor[0], trailColor[1]+50, trailColor[2]+50, 200); // Brighter version?
+        line(startScreen.x, startScreen.y, currentScreen.x, currentScreen.y);
+
+        // Head color (e.g., white or light blue?)
+        noStroke();
+        fill(180, 220, 255); // Light blue head
+        let headSize = max(2, 4 / zoom);
+        ellipse(currentScreen.x, currentScreen.y, headSize, headSize);
+    }
+    pop();
+}
+
+// --- Create Intercept Explosion Drawing Function ---
+function drawInterceptExplosions() {
+     push();
+     noStroke();
+     for (let i = activeIntercepts.length - 1; i >= 0; i--) {
+         let icept = activeIntercepts[i];
+         icept.age++;
+         if (icept.age > icept.duration) {
+             activeIntercepts.splice(i, 1);
+             continue;
+         }
+
+         let screenPos = worldToScreen(icept.x, icept.y);
+         let progress = icept.age / icept.duration;
+         // Small, quick flash - maybe white/blue?
+         let radius = lerp(0, 15, sqrt(progress)) / zoom ; // Small screen radius
+         let alpha = lerp(255, 0, progress * progress); // Fade out quickly
+
+         fill(200, 220, 255, alpha); // White-blue flash
+         ellipse(screenPos.x, screenPos.y, radius*2);
+     }
+     pop();
 }
