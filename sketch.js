@@ -321,8 +321,11 @@ function drawGameScreen() {
     updateDefenseActions(); // <<< CALL DEFENSE LOGIC
     updateMissiles(); // Updates ICBMs
     updateABMs(); // <<< UPDATE ABM POSITIONS (Need to create this function)
+    updateNeutralPlanes(gameCities, deltaTime); // <<< CALL PLANE UPDATE (pass cities and deltaTime)
+    // --- Drawing ---
     drawBackgroundMapAndCities();
     gameUnits.forEach(unit => { drawUnit(unit); });
+    drawNeutralPlanes(); // <<< DRAW PLANES
     drawMissiles();
     drawABMs(); // <<< DRAW ABMS (Need to create this function)
     drawExplosions(); // Includes ICBM impacts
@@ -498,6 +501,9 @@ function initializeGameSetup(playerTerritoryKey) {
         }
         console.log(`Added ${gameCities.length} cities to gameCities (pop >= ${POP_TIER1_THRESHOLD}). ${processedCount} assigned to specific territories. ${unownedCount} initially unassigned from main territories (now Neutral).`);
     }
+
+    // *** INITIALIZE PLANES AFTER CITIES ARE READY ***
+    initializeNeutralPlanes(gameCities); // Pass the processed cities
 
     // --- Initialize Player Assets ---
     // (Only need to define assets for the human player to place)
